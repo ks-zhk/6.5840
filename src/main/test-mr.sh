@@ -13,7 +13,7 @@ then
   then
     # -race with plug-ins on x86 MacOS 12 with
     # go1.17 before 1.17.6 sometimes crash.
-    RACE=
+    RACE=-race
     echo '*** Turning off -race since it may not work on a Mac'
     echo '    with ' `go version`
   fi

@@ -6,13 +6,16 @@ package main
 // go run mrsequential.go wc.so pg*.txt
 //
 
-import "fmt"
-import "6.5840/mr"
-import "plugin"
-import "os"
-import "log"
-import "io/ioutil"
-import "sort"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"plugin"
+	"sort"
+
+	"6.5840/mr"
+)
 
 // for sorting by key.
 type ByKey []mr.KeyValue
@@ -28,7 +31,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	mapf, reducef := loadPlugin(os.Args[1])
+	mapf, reducef := LoadPlugin(os.Args[1])
 
 	//
 	// read each input file,
@@ -88,7 +91,7 @@ func main() {
 
 // load the application Map and Reduce functions
 // from a plugin file, e.g. ../mrapps/wc.so
-func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
+func LoadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
 	p, err := plugin.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot load plugin %v", filename)
