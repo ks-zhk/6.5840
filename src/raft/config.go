@@ -276,6 +276,10 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	// a fresh set of outgoing ClientEnd names.
 	// so that old crashed instance's ClientEnds can't send.
 	cfg.endnames[i] = make([]string, cfg.n)
+	// 每个服务器之间都存在连接
+	// i指的当前raft的下标
+	// j指的是其他raft的下标
+	// ？？为什么i和j可以相等，自己与自己相连的话。。。
 	for j := 0; j < cfg.n; j++ {
 		cfg.endnames[i][j] = randstring(20)
 	}
