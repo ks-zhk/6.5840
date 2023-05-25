@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"errors"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -49,8 +50,9 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 type Entry struct {
-	term  int
-	index int
+	Term    int
+	Index   int
+	Command interface{}
 }
 
 // A Go object implementing a single Raft peer.
@@ -62,11 +64,13 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// below is (2A)
-	term     int   // current term, or latest term server has seen. initial is 0 on first boot
-	state    State // current state, [leader, follower, candidate]
-	voteGet  int   // when in candidate, and only in candidate state, this value is valid, means vote get from follower
-	hasVoted bool  // only when in follower state is valid. every time when term update, the hasVote will reset to false
-	getMsg   bool
+	term              int   // current term, or latest term server has seen. initial is 0 on first boot
+	state             State // current state, [leader, follower, candidate]
+	voteGet           int   // when in candidate, and only in candidate state, this value is valid, means vote get from follower
+	hasVoted          bool  // only when in follower state is valid. every time when term update, the hasVote will reset to false
+	getMsg            bool
+	lastHeartBeatOver []bool
+	sendReqChan       []reqWarp
 	// below if (2B)
 	logs        []Entry
 	commitIndex int
@@ -79,7 +83,38 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 }
+type reqWarp struct {
+	Req RequestAppendEntries
+	Msg Msg
+}
 
+func (rf *Raft) finishLastHeartWithLock(peerId int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.lastHeartBeatOver[peerId] = true
+}
+func (rf *Raft) getPrevInfoByPeerIdxNoneLock(peerId int) (prevIndex int, prevTerm int) {
+	if rf.nextIndex[peerId] == 1 {
+		prevIndex = -1
+		prevTerm = -1
+		return
+	} else {
+		prevIndex = rf.nextIndex[peerId] - 1
+		prevTerm = rf.logs[prevIndex-1].Term
+		return
+	}
+}
+func (rf *Raft) initOfAllServerNoneLock() {
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+}
+func (rf *Raft) convertToLeaderConfigNoneLock() {
+	for i := 0; i < len(rf.nextIndex); i++ {
+		rf.nextIndex[i] = len(rf.logs) + 1
+		rf.matchIndex[i] = 0
+		rf.lastHeartBeatOver[i] = true
+	}
+}
 func (rf *Raft) PrevEntryInfo() (prevLogTerm int, PrevLogIndex int) {
 	if len(rf.logs) == 0 {
 		prevLogTerm = -1
@@ -97,6 +132,13 @@ const (
 	Leader    State = 0
 	Follower  State = 1
 	Candidate State = 2
+)
+
+type Msg int
+
+const (
+	Normal Msg = 0
+	Quit   Msg = 1
 )
 
 // return currentTerm and whether this server
@@ -119,7 +161,7 @@ func (rf *Raft) isCandidate() bool {
 	rf.mu.Unlock()
 	return res
 }
-func (rf *Raft) isLeader() bool {
+func (rf *Raft) isLeaderWithLock() bool {
 	var res bool
 	rf.mu.Lock()
 	res = rf.state == Leader
@@ -178,11 +220,19 @@ func (rf *Raft) getVoteReqArgsNoneLock() RequestVoteArgs {
 		LastLogIndex: -1,
 	}
 }
-func (rf *Raft) getHeartBeatMsgNoneLock() RequestAppendEntries {
-	//if rf.state != Leader {
-	//	panic("not allowed to get heartBeat when me is not leader")
-	//}
-	return RequestAppendEntries{Term: rf.term, LeaderId: rf.me, PrevLogTerm: -1, PrevLogIndex: -1}
+func (rf *Raft) getHeartBeatMsgNoneLock(peerId int) (RequestAppendEntries, error) {
+	if rf.state != Leader {
+		return RequestAppendEntries{}, errors.New("raft is not leader")
+	}
+	prevLogTerm, prevLogIndex := rf.getPrevInfoByPeerIdxNoneLock(peerId)
+	return RequestAppendEntries{
+		Term:         rf.term,
+		LeaderId:     rf.me,
+		PrevLogTerm:  prevLogTerm,
+		PrevLogIndex: prevLogIndex,
+		Entries:      []Entry{},
+		LeaderCommit: rf.commitIndex,
+	}, nil
 }
 func (rf *Raft) sendVoteReqToAllPeerNoneLock() {
 	for idx, _ := range rf.peers {
@@ -275,8 +325,8 @@ type RequestAppendEntries struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	entries      []Entry
-	leaderCommit int
+	Entries      []Entry
+	LeaderCommit int
 }
 type ReplyAppendEntries struct {
 	Term    int
@@ -295,35 +345,58 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 	if args.Term > rf.term {
 		rf.convertToFollowerNoneLock(args.Term)
 	}
+	rf.getMsg = true
 	reply.Term = rf.term
 	if rf.state == Follower {
+		// 特殊情况特殊讨论
+		if args.PrevLogIndex == -1 {
+			// 最特殊的情况, 直接无脑加log即可
+			for _, log := range args.Entries {
+				rf.logs = append(rf.logs, log)
+			}
+			if args.LeaderCommit > rf.commitIndex {
+				if args.LeaderCommit < len(rf.logs) {
+					rf.commitIndex = args.LeaderCommit
+				} else {
+					rf.commitIndex = len(rf.logs)
+				}
+			}
+			reply.Success = true
+			return
+		}
 		if len(rf.logs) < args.PrevLogIndex {
 			reply.Success = false
 			return
 		}
-		if rf.logs[args.PrevLogIndex-1].term != args.PrevLogTerm {
+		if rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 			rf.logs = rf.logs[:args.PrevLogIndex-1]
 			reply.Success = false
 			return
 		}
 		follow := len(rf.logs) - args.PrevLogIndex
 		reply.Success = true
-		if len(args.entries) > follow {
-			for i := follow; i < len(args.entries); i++ {
-				rf.logs = append(rf.logs, args.entries[i])
+		if len(args.Entries) > follow {
+			for i := follow; i < len(args.Entries); i++ {
+				rf.logs = append(rf.logs, args.Entries[i])
 			}
 		}
-		if args.leaderCommit > rf.commitIndex {
-			// TODO
+		if args.LeaderCommit > rf.commitIndex {
+			if args.LeaderCommit < len(rf.logs) {
+				rf.commitIndex = args.LeaderCommit
+			} else {
+				rf.commitIndex = len(rf.logs)
+			}
 		}
-		return
+		reply.Success = true
 	} else if rf.state == Candidate {
 		// candidate
-		panic("candidate receive append req from leader??")
+		rf.convertToFollowerNoneLock(args.Term)
+		reply.Success = true
 	} else {
 		// leader
-		panic("split brain")
+		reply.Success = false
 	}
+	return
 }
 
 func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
@@ -446,23 +519,52 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return
 }
 func (rf *Raft) sendHeartBeatLoop() {
-	for {
+	for rf.killed() == false {
 		rf.mu.Lock()
 		if rf.state != Leader {
 			rf.mu.Unlock()
 			return
 		}
 		for idx, peer := range rf.peers {
-			if idx == rf.me {
+			if idx == rf.me || rf.lastHeartBeatOver[idx] == false {
 				continue
 			}
-			go func(peer *labrpc.ClientEnd, rf *Raft) {
+			rf.lastHeartBeatOver[idx] = false
+			go func(peer *labrpc.ClientEnd, rf *Raft, peerId int) {
+				defer rf.finishLastHeartWithLock(peerId)
+
 				var reply ReplyAppendEntries
 				rf.mu.Lock()
-				req := rf.getHeartBeatMsgNoneLock()
+				req, err := rf.getHeartBeatMsgNoneLock(peerId)
 				rf.mu.Unlock()
-				_ = peer.Call("Raft.HeartBeat", &req, &reply)
-				// TODO: need to solve false rpc call?
+				if err != nil {
+					DPrintf("error = %v", err)
+					return
+				}
+				_ = peer.Call("Raft.AppendEntries", &req, &reply)
+				// TODO: (2B)solve the false, decrease the nextIndex
+				for reply.Success == false {
+					// 如果已经被删了或者不是leader了，直接润喽
+					if rf.killed() || !rf.isLeaderWithLock() {
+						return
+					}
+					rf.mu.Lock()
+					rf.nextIndex[peerId] = rf.nextIndex[peerId] - 1
+					req, err := rf.getHeartBeatMsgNoneLock(peerId)
+					rf.mu.Unlock()
+					if err != nil {
+						DPrintf("error = %v", err)
+						return
+					}
+					var res = false
+					// 重复发送，但是容易陷入死循环，因此每次都会判断一波
+					for res == false {
+						if rf.killed() || !rf.isLeaderWithLock() {
+							return
+						}
+						res = peer.Call("Raft.AppendEntries", &req, &reply)
+					}
+				}
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.Term < rf.term {
@@ -472,13 +574,16 @@ func (rf *Raft) sendHeartBeatLoop() {
 					rf.convertToFollowerNoneLock(reply.Term)
 				}
 				return
-			}(peer, rf)
+			}(peer, rf, idx)
 		}
 		rf.mu.Unlock()
 		ms := 100 + (rand.Int63() % 20)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	return
+}
+func (rf *Raft) RequestAppendEntries(command interface{}) {
+
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -497,8 +602,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader = rf.state == Leader
+	if !isLeader || rf.killed() {
+		return index, term, isLeader
+	}
 	// Your code here (2B).
+	rf.logs = append(rf.logs, Entry{
+		Term:    rf.term,
+		Index:   len(rf.logs) + 1,
+		Command: command,
+	})
+	index = len(rf.logs)
+	term = rf.term
+	// TODO: start to append log
 
 	return index, term, isLeader
 }
@@ -515,66 +633,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	// graceful shutdown
 }
 
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
-}
-func (rf *Raft) beginElection(ch chan ElectionMsg) {
-	//rf.mu.Lock()
-	//rf.state = Candidate
-	//rf.term += 1
-	//rf.voteGet = 1 // vote for self
-	//for{
-	//	for idx, peer := range rf.peers {
-	//		if rf.me == idx {
-	//			continue
-	//		}
-	//		// TODO: 做好现有entry的准备，为之后的2B做准备
-	//	}
-	//	rf.mu.Unlock()
-	//	nrd := false
-	//	for res := range ch {
-	//		switch res {
-	//		case GetVote:
-	//			{
-	//				rf.mu.Lock()
-	//				if rf.state != Candidate{
-	//					rf.mu.Unlock()
-	//					continue
-	//				}
-	//				rf.voteGet += 1
-	//				if rf.voteGet > len(rf.peers)/2{
-	//					rf.state = Leader
-	//					go rf.sendHeartBeatLoop()
-	//					rf.mu.Unlock()
-	//					return
-	//				}
-	//				rf.mu.Unlock()
-	//			}
-	//		case NewRount:
-	//			{
-	//				rf.mu.Lock()
-	//				if rf.state != Candidate{
-	//					rf.mu.Unlock()
-	//					continue
-	//				}
-	//				rf.state = Candidate
-	//				rf.term += 1
-	//				rf.voteGet = 1 // vote for self
-	//				nrd = true
-	//				break
-	//			}
-	//		case BecomeFollower:
-	//			{
-	//				// TODO: 这里应该直接返回，此时最新的Term已经更新
-	//			}
-	//		}
-	//	}
-	//
-	//}
-
 }
 
 type ElectionMsg int
@@ -602,6 +666,7 @@ func (rf *Raft) ticker() {
 					if rf.state == Candidate {
 						if rf.voteGet > len(rf.peers)/2 {
 							rf.state = Leader
+							rf.convertToLeaderConfigNoneLock()
 							go rf.sendHeartBeatLoop()
 							finish = true
 							break
@@ -616,6 +681,9 @@ func (rf *Raft) ticker() {
 					// 10毫秒检测一次
 					time.Sleep(time.Duration(10) * time.Millisecond)
 					cost += 10
+					if rf.killed() {
+						return
+					}
 					if cost > newTimeout {
 						break
 					}
@@ -648,6 +716,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	// Your initialization code here (2A, 2B, 2C).
+	rf.nextIndex = []int{}
+	rf.matchIndex = []int{}
+	for _, _ = range peers {
+		rf.nextIndex = append(rf.nextIndex, 1)
+		rf.matchIndex = append(rf.matchIndex, 0)
+		rf.lastHeartBeatOver = append(rf.lastHeartBeatOver, true)
+	}
+	rf.commitIndex = 0
 	rf.state = Follower
 	rf.getMsg = false
 	rf.voteGet = 0
