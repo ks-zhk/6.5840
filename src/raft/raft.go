@@ -68,7 +68,12 @@ type Raft struct {
 	hasVoted bool  // only when in follower state is valid. every time when term update, the hasVote will reset to false
 	getMsg   bool
 	// below if (2B)
-	logs []Entry
+	logs        []Entry
+	commitIndex int
+	lastApplied int
+
+	nextIndex  []int
+	matchIndex []int
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -270,10 +275,55 @@ type RequestAppendEntries struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
+	entries      []Entry
+	leaderCommit int
 }
 type ReplyAppendEntries struct {
 	Term    int
 	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntries) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.term {
+		reply.Term = rf.term
+		reply.Success = false
+		return
+	}
+	if args.Term > rf.term {
+		rf.convertToFollowerNoneLock(args.Term)
+	}
+	reply.Term = rf.term
+	if rf.state == Follower {
+		if len(rf.logs) < args.PrevLogIndex {
+			reply.Success = false
+			return
+		}
+		if rf.logs[args.PrevLogIndex-1].term != args.PrevLogTerm {
+			rf.logs = rf.logs[:args.PrevLogIndex-1]
+			reply.Success = false
+			return
+		}
+		follow := len(rf.logs) - args.PrevLogIndex
+		reply.Success = true
+		if len(args.entries) > follow {
+			for i := follow; i < len(args.entries); i++ {
+				rf.logs = append(rf.logs, args.entries[i])
+			}
+		}
+		if args.leaderCommit > rf.commitIndex {
+			// TODO
+		}
+		return
+	} else if rf.state == Candidate {
+		// candidate
+		panic("candidate receive append req from leader??")
+	} else {
+		// leader
+		panic("split brain")
+	}
 }
 
 func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
