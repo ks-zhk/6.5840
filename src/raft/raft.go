@@ -70,7 +70,7 @@ type Raft struct {
 	hasVoted          bool  // only when in follower state is valid. every time when term update, the hasVote will reset to false
 	getMsg            bool
 	lastHeartBeatOver []bool
-	sendReqChan       []reqWarp
+	sendReqChan       chan reqWarp
 	// below if (2B)
 	logs        []Entry
 	commitIndex int
@@ -632,6 +632,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	// close req send loop
+	rf.sendReqChan <- reqWarp{
+		Req: RequestAppendEntries{},
+		Msg: Quit,
+	}
+
 	// Your code here, if desired.
 	// graceful shutdown
 }
@@ -663,6 +669,10 @@ func (rf *Raft) ticker() {
 				var cost int64 = 0
 				for {
 					rf.mu.Lock()
+					if rf.killed() {
+						rf.mu.Unlock()
+						return
+					}
 					if rf.state == Candidate {
 						if rf.voteGet > len(rf.peers)/2 {
 							rf.state = Leader
