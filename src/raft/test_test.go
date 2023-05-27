@@ -192,6 +192,7 @@ func TestFollowerFailure2B(t *testing.T) {
 	// disconnect one follower from the network.
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 1) % servers)
+	fmt.Printf("disconnect %v\n", (leader1+1)%servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
@@ -218,6 +219,7 @@ func TestFollowerFailure2B(t *testing.T) {
 	// check that command 104 did not commit.
 	n, _ := cfg.nCommitted(index)
 	if n > 0 {
+		fmt.Println(n)
 		t.Fatalf("%v committed but no majority", n)
 	}
 
@@ -519,20 +521,22 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
-
+	fmt.Println("connect all")
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
-
+	fmt.Println("here!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
+	fmt.Printf("leader 2 = %v\n", leader2)
 	other := (leader1 + 2) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
+	fmt.Printf("other = %v\n", other)
 	cfg.disconnect(other)
-
+	fmt.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!????????????????????????????????????")
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())

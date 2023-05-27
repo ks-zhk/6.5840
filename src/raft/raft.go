@@ -19,9 +19,11 @@ package raft
 
 import (
 	"errors"
+	"fmt"
+	"sync"
+
 	//	"bytes"
 	"math/rand"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -76,8 +78,9 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	nextIndex  []int
-	matchIndex []int
+	nextIndex     []int
+	matchIndex    []int
+	CallerApplyCh chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -88,13 +91,20 @@ type reqWarp struct {
 	Msg Msg
 }
 
+func (rf *Raft) getLastLogTermNoneLock() int {
+	if len(rf.logs) == 0 {
+		return 0
+	} else {
+		return rf.logs[len(rf.logs)-1].Term
+	}
+}
 func (rf *Raft) finishLastHeartWithLock(peerId int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.lastHeartBeatOver[peerId] = true
 }
 func (rf *Raft) getPrevInfoByPeerIdxNoneLock(peerId int) (prevIndex int, prevTerm int) {
-	if rf.nextIndex[peerId] == 1 {
+	if rf.nextIndex[peerId] <= 1 {
 		prevIndex = 0
 		prevTerm = 0
 		return
@@ -133,7 +143,7 @@ func (rf *Raft) convertToLeaderConfigNoneLock() {
 		rf.nextIndex[i] = len(rf.logs) + 1
 		rf.matchIndex[i] = 0
 		rf.lastHeartBeatOver[i] = true
-		rf.applyCh[i] = make(chan reqWarp, 100)
+		rf.applyCh[i] = make(chan reqWarp, 10000)
 		go rf.onePeerOneChannel(i, rf.term)
 	}
 
@@ -171,11 +181,10 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isLeader bool
-	// Your code here (2A). ok
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term = rf.term
 	isLeader = rf.state == Leader
-	rf.mu.Unlock()
 	return term, isLeader
 }
 func (rf *Raft) isCandidate() bool {
@@ -240,15 +249,15 @@ func (rf *Raft) getVoteReqArgsNoneLock() RequestVoteArgs {
 	return RequestVoteArgs{
 		Term:         rf.term,
 		CandidateId:  rf.me,
-		LastLogTerm:  -1,
-		LastLogIndex: -1,
+		LastLogTerm:  rf.getLastLogTermNoneLock(),
+		LastLogIndex: len(rf.logs),
 	}
 }
 func (rf *Raft) getHeartBeatMsgNoneLock(peerId int) (RequestAppendEntries, error) {
 	if rf.state != Leader {
 		return RequestAppendEntries{}, errors.New("raft is not leader")
 	}
-	prevLogTerm, prevLogIndex := rf.getPrevInfoByPeerIdxNoneLock(peerId)
+	prevLogIndex, prevLogTerm := rf.getPrevInfoByPeerIdxNoneLock(peerId)
 	return RequestAppendEntries{
 		Term:         rf.term,
 		LeaderId:     rf.me,
@@ -361,9 +370,11 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.term {
+		fmt.Printf("%v get append req, but the term is big\n", rf.me)
 		rf.convertToFollowerNoneLock(args.Term)
 	}
 	if args.Term < rf.term {
+		fmt.Printf("%v get append req, but the term is small\n", rf.me)
 		reply.Term = rf.term
 		reply.Success = false
 		return
@@ -374,17 +385,48 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 		// 特殊情况特殊讨论
 		if args.PrevLogIndex == 0 {
 			// 最特殊的情况, 直接无脑加log即可
-			for _, log := range args.Entries {
+			fmt.Printf("in it\n")
+			var i int
+			for i = args.PrevLogIndex; i < args.PrevLogIndex+len(args.Entries) && i < len(rf.logs); i++ {
+				if rf.logs[i].Term != args.Entries[i-args.PrevLogIndex].Term {
+					break
+				}
+			}
+			if i < args.PrevLogIndex+len(args.Entries) {
+				rf.logs = rf.logs[:i]
+			}
+			for _, log := range args.Entries[i-args.PrevLogIndex:] {
 				rf.logs = append(rf.logs, log)
+				//rf.CallerApplyCh <- ApplyMsg{
+				//	CommandValid: true,
+				//	CommandIndex: len(rf.logs),
+				//	Command:      log.Command,
+				//}
 			}
 			if args.LeaderCommit > rf.commitIndex {
 				if args.LeaderCommit < len(rf.logs) {
+					for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
+						rf.CallerApplyCh <- ApplyMsg{
+							CommandValid: true,
+							Command:      rf.logs[i-1].Command,
+							CommandIndex: rf.logs[i-1].Index,
+						}
+					}
 					rf.commitIndex = args.LeaderCommit
 				} else {
+					// TODO: 是否要在之前的操作中把那个玩意给干掉。
+					for i := rf.commitIndex + 1; i <= len(rf.logs); i++ {
+						rf.CallerApplyCh <- ApplyMsg{
+							CommandValid: true,
+							Command:      rf.logs[i-1].Command,
+							CommandIndex: rf.logs[i-1].Index,
+						}
+					}
 					rf.commitIndex = len(rf.logs)
 				}
 			}
 			reply.Success = true
+			fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
 			return
 		}
 		if len(rf.logs) < args.PrevLogIndex {
@@ -396,17 +438,42 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 			reply.Success = false
 			return
 		}
-		follow := len(rf.logs) - args.PrevLogIndex
-		reply.Success = true
-		if len(args.Entries) > follow {
-			for i := follow; i < len(args.Entries); i++ {
-				rf.logs = append(rf.logs, args.Entries[i])
+		var i int
+		for i = args.PrevLogIndex; i < args.PrevLogIndex+len(args.Entries) && i < len(rf.logs); i++ {
+			if rf.logs[i].Term != args.Entries[i-args.PrevLogIndex].Term {
+				break
 			}
+		}
+		if i < args.PrevLogIndex+len(args.Entries) {
+			rf.logs = rf.logs[:i]
+		}
+		for _, log := range args.Entries[i-args.PrevLogIndex:] {
+			rf.logs = append(rf.logs, log)
+			//rf.CallerApplyCh <- ApplyMsg{
+			//	CommandValid: true,
+			//	CommandIndex: len(rf.logs),
+			//	Command:      log.Command,
+			//}
 		}
 		if args.LeaderCommit > rf.commitIndex {
 			if args.LeaderCommit < len(rf.logs) {
+				for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
+					rf.CallerApplyCh <- ApplyMsg{
+						CommandValid: true,
+						Command:      rf.logs[i-1].Command,
+						CommandIndex: rf.logs[i-1].Index,
+					}
+				}
 				rf.commitIndex = args.LeaderCommit
 			} else {
+				// TODO: 是否要在之前的操作中把那个玩意给干掉。
+				for i := rf.commitIndex + 1; i <= len(rf.logs); i++ {
+					rf.CallerApplyCh <- ApplyMsg{
+						CommandValid: true,
+						Command:      rf.logs[i-1].Command,
+						CommandIndex: rf.logs[i-1].Index,
+					}
+				}
 				rf.commitIndex = len(rf.logs)
 			}
 		}
@@ -419,6 +486,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 		// leader
 		reply.Success = false
 	}
+	fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
 	return
 }
 
@@ -446,15 +514,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.term {
 		rf.convertToFollowerNoneLock(args.Term)
 	}
-	// TODO: 2B, about LOG Entry
 	switch rf.state {
 	case Follower:
 		{
 			// 先来先到原则
 			if !rf.hasVoted {
-				rf.hasVoted = true
-				reply.Voted = true
+				if args.LastLogTerm < rf.getLastLogTermNoneLock() {
+					reply.Voted = false
+					fmt.Println("deny!!")
+				} else if args.LastLogTerm == rf.getLastLogTermNoneLock() {
+					if len(rf.logs) > args.LastLogIndex {
+						reply.Voted = false
+						fmt.Println("deny!!")
+					} else {
+						rf.hasVoted = true
+						reply.Voted = true
+					}
+				} else {
+					rf.hasVoted = true
+					reply.Voted = true
+				}
 			} else {
+				fmt.Println("deny!!")
 				reply.Voted = false
 			}
 		}
@@ -526,6 +607,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 					LeaderId: rf.me,
 				}
 				rf.mu.Unlock()
+				break
 			}
 		case Quit:
 			{
@@ -544,6 +626,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				}
 				msg.Req = req
 				rf.mu.Unlock()
+				break
 			}
 		}
 		if rf.killed() || !rf.isLeaderWithLock() {
@@ -551,21 +634,16 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 		}
 		var reply ReplyAppendEntries
 		res := false
-		rf.mu.Lock()
-		// 修改prevIndex以及prevTerm，以适应当前nextIndex
-		//if rf.nextIndex[peerId]-1 > msg.Req.PrevLogIndex {
-		//	//msg.Req.Entries = msg.Req.Entries[:]
-		//
-		//}
-		rf.mu.Unlock()
 		for res == false {
 			if !rf.lockWithCheckForLeader(term) {
 				return
 			}
 			// 相等验证
+			fmt.Printf("%v in first call, msg = %v\n", rf.me, msg)
 			rf.mu.Unlock()
 			res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
 		}
+		fmt.Printf("%v reply = %v\n", rf.me, reply)
 		rf.onGetMsgWithLock()
 		for reply.Success == false {
 			// decrease
@@ -581,8 +659,11 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				rf.mu.Unlock()
 				break
 			}
+			fmt.Printf("%v now term is %v\n", rf.me, rf.term)
+			fmt.Printf("%v nextIndex[%v] = %v\n", rf.me, peerId, rf.nextIndex[peerId])
 			rf.nextIndex[peerId] -= 1
 			hReq, err := rf.getHeartBeatMsgNoneLock(peerId)
+			fmt.Println(hReq)
 			if err != nil {
 				rf.mu.Unlock()
 				return
@@ -592,7 +673,9 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			msg.Req.PrevLogIndex = hReq.PrevLogIndex
 			msg.Req.LeaderId = rf.me
 			msg.Req.LeaderCommit = hReq.LeaderCommit
-			msg.Req.Entries = append([]Entry{rf.logs[rf.nextIndex[peerId]]}, msg.Req.Entries...)
+			fmt.Printf("%v's log %v\n", rf.me, rf.logs)
+			msg.Req.Entries = append([]Entry{rf.logs[rf.nextIndex[peerId]-1]}, msg.Req.Entries...)
+			//fmt.Println(msg)
 			rf.mu.Unlock()
 			res = false
 			for res == false {
@@ -602,6 +685,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				rf.mu.Unlock()
 				res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
 			}
+			fmt.Println("ok")
 			rf.onGetMsgWithLock()
 		}
 		if !rf.lockWithCheckForLeader(term) {
@@ -616,10 +700,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			rf.mu.Unlock()
 			continue
 		}
-		if rf.term != term {
-			rf.mu.Unlock()
-			return
-		}
+		fmt.Printf("LEADER %v's log %v\n", rf.me, rf.logs)
 		rf.matchIndex[peerId] = msg.Req.PrevLogIndex + len(msg.Req.Entries)
 		rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
 		// 找到最低的那个， 二分，线性
@@ -635,6 +716,13 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				}
 			}
 			if cnt >= (len(rf.peers)+1)/2 && rf.logs[n-1].Term == rf.term {
+				for i := rf.commitIndex + 1; i <= n; i++ {
+					rf.CallerApplyCh <- ApplyMsg{
+						CommandValid: true,
+						Command:      rf.logs[i-1].Command,
+						CommandIndex: i,
+					}
+				}
 				rf.commitIndex = n
 				break
 			}
@@ -712,7 +800,7 @@ func (rf *Raft) sendHeartBeatLoop(term int) {
 				rf.mu.Unlock()
 				return
 			}
-			hb := reqWarp{Msg: HeartBeat}
+			hb := reqWarp{Req: RequestAppendEntries{}, Msg: HeartBeat}
 			rf.applyCh[idx] <- hb
 			rf.mu.Unlock()
 		}
@@ -721,6 +809,33 @@ func (rf *Raft) sendHeartBeatLoop(term int) {
 	}
 	return
 }
+
+//	func (rf *Raft) sendHeartBeatLoopNoneLock(term int) {
+//		for rf.killed() == false {
+//			if rf.state != Leader {
+//				return
+//			}
+//			for idx, _ := range rf.peers {
+//				if idx == rf.me {
+//					continue
+//				}
+//				if !rf.lockWithCheckForLeader(term) {
+//					return
+//				}
+//				_, err := rf.getHeartBeatMsgNoneLock(idx)
+//				if err != nil {
+//					rf.mu.Unlock()
+//					return
+//				}
+//				hb := reqWarp{Req: RequestAppendEntries{}, Msg: HeartBeat}
+//				rf.applyCh[idx] <- hb
+//				rf.mu.Unlock()
+//			}
+//			ms := 100 + (rand.Int63() % 10)
+//			time.Sleep(time.Duration(ms) * time.Millisecond)
+//		}
+//		return
+//	}
 func (rf *Raft) requestAppendEntries(command interface{}, peerId int) {
 
 }
@@ -753,15 +868,23 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   len(rf.logs) + 1,
 		Command: command,
 	})
+	rf.matchIndex[rf.me] = len(rf.logs)
+	//rf.CallerApplyCh <- ApplyMsg{
+	//	CommandValid: true,
+	//	CommandIndex: len(rf.logs),
+	//	Command:      command,
+	//}
 	index = len(rf.logs)
 	term = rf.term
 	// TODO: start to append log
 	// first, 检查所有peer的nextIndex，查看是否比较落后
 	// 如果不是最新的，那么就直接发送一个msg，进行复制操作
 	for idx, nextIdx := range rf.nextIndex {
+		if idx == rf.me {
+			continue
+		}
 		if nextIdx <= len(rf.logs) {
-			// TODO: 准备开送, 这样子就是一个一个送了，到最后，啊这。。。。尝试优化为批量送，
-			rf.applyCh[idx] <- reqWarp{Msg: Normal}
+			rf.applyCh[idx] <- reqWarp{Req: RequestAppendEntries{}, Msg: Normal}
 		}
 	}
 	return index, term, isLeader
@@ -824,8 +947,10 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (2A)
 		rf.mu.Lock()
+		//fmt.Printf("%v tick\n", rf.me)
 		if rf.needNextElectionNoneLock() {
 			for {
+				// fmt.Printf("%v timeout, become candidate\n", rf.me)
 				rf.becomeCandidateNoneLock()
 				rf.sendVoteReqToAllPeerNoneLock()
 				rf.mu.Unlock()
@@ -898,7 +1023,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex = append(rf.nextIndex, 1)
 		rf.matchIndex = append(rf.matchIndex, 0)
 		rf.lastHeartBeatOver = append(rf.lastHeartBeatOver, true)
-		rf.applyCh = append(rf.applyCh, make(chan reqWarp, 100))
+		rf.applyCh = append(rf.applyCh, make(chan reqWarp, 10000))
 	}
 	rf.commitIndex = 0
 	rf.state = Follower
@@ -908,6 +1033,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = []Entry{}
 	rf.term = 0
 	rf.dead = 0
+	rf.CallerApplyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
