@@ -50,9 +50,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 type Entry struct {
-	Term    int
-	Index   int
-	Command interface{}
+	Term  int
+	Index int
+	// only in leader is valid
+	LogCount int
+	Command  interface{}
 }
 
 // A Go object implementing a single Raft peer.
@@ -71,6 +73,7 @@ type Raft struct {
 	getMsg            bool
 	lastHeartBeatOver []bool
 	sendReqChan       chan reqWarp
+	applyCh           []chan reqWarp
 	// below if (2B)
 	logs        []Entry
 	commitIndex int
@@ -137,8 +140,9 @@ const (
 type Msg int
 
 const (
-	Normal Msg = 0
-	Quit   Msg = 1
+	Normal    Msg = 0
+	Quit      Msg = 1
+	HeartBeat Msg = 2
 )
 
 // return currentTerm and whether this server
@@ -470,6 +474,66 @@ func (rf *Raft) HeartBeat(args *RequestAppendEntries, reply *ReplyAppendEntries)
 	reply.Term = rf.term
 	return
 }
+func (rf *Raft) onePeerOneChannel(peerId int) {
+	// lazy, but heartBeat can start it
+	for msg := range rf.applyCh[peerId] {
+		// 如果是退出信号，那就直接润
+		if msg.Msg == Quit {
+			return
+		}
+		if rf.killed() || !rf.isLeaderWithLock() {
+			return
+		}
+		var reply ReplyAppendEntries
+		res := false
+		for res == false {
+			res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
+		}
+		for reply.Success == false {
+			// decrease
+			if rf.killed() || !rf.isLeaderWithLock() {
+				return
+			}
+			rf.mu.Lock()
+			if reply.Term > rf.term {
+				rf.convertToFollowerNoneLock(reply.Term)
+				rf.mu.Unlock()
+				return
+			}
+			rf.nextIndex[peerId] -= 1
+			hReq, err := rf.getHeartBeatMsgNoneLock(peerId)
+			if err != nil {
+				rf.mu.Unlock()
+				return
+			}
+			msg.Req.Term = hReq.Term
+			msg.Req.PrevLogTerm = hReq.PrevLogTerm
+			msg.Req.PrevLogIndex = hReq.PrevLogIndex
+			msg.Req.LeaderId = rf.me
+			msg.Req.LeaderCommit = hReq.LeaderCommit
+			rf.mu.Unlock()
+			res = false
+			for res == false {
+				res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
+			}
+		}
+		// success
+		rf.mu.Lock()
+		if reply.Term > rf.term {
+			rf.convertToFollowerNoneLock(reply.Term)
+			rf.mu.Unlock()
+			return
+		}
+		for _, entry := range msg.Req.Entries {
+			rf.logs[entry.Index-1].LogCount += 1
+			if rf.logs[entry.Index-1].LogCount == (len(rf.peers)+1)/2 {
+				rf.commitIndex = entry.Index
+			}
+		}
+
+		rf.mu.Unlock()
+	}
+}
 
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -582,7 +646,7 @@ func (rf *Raft) sendHeartBeatLoop() {
 	}
 	return
 }
-func (rf *Raft) RequestAppendEntries(command interface{}) {
+func (rf *Raft) requestAppendEntries(command interface{}, peerId int) {
 
 }
 
@@ -610,9 +674,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	// Your code here (2B).
 	rf.logs = append(rf.logs, Entry{
-		Term:    rf.term,
-		Index:   len(rf.logs) + 1,
-		Command: command,
+		Term:     rf.term,
+		Index:    len(rf.logs) + 1,
+		Command:  command,
+		LogCount: 1,
 	})
 	index = len(rf.logs)
 	term = rf.term
@@ -655,6 +720,23 @@ const (
 	BecomeFollower ElectionMsg = 3
 )
 
+func (rf *Raft) sendAppendEntriesLoop() {
+	for msg := range rf.sendReqChan {
+		if msg.Msg == Quit {
+			return
+		}
+		if rf.killed() || !rf.isLeaderWithLock() {
+			return
+		}
+		go func(req RequestAppendEntries) {
+			for idx, _ := range rf.peers {
+				if idx == rf.me {
+					continue
+				}
+			}
+		}(msg.Req)
+	}
+}
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (2A)
