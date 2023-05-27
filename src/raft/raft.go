@@ -19,8 +19,6 @@ package raft
 
 import (
 	"errors"
-	"fmt"
-
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -363,7 +361,6 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.term {
-		fmt.Printf("%v convert to follower\n", rf.me)
 		rf.convertToFollowerNoneLock(args.Term)
 	}
 	if args.Term < rf.term {
@@ -417,7 +414,6 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 	} else if rf.state == Candidate {
 		// candidate
 		rf.convertToFollowerNoneLock(args.Term)
-		fmt.Printf("%v convert to follower\n", rf.me)
 		reply.Success = true
 	} else {
 		// leader
@@ -825,12 +821,10 @@ const (
 //		}
 //	}
 func (rf *Raft) ticker() {
-	fmt.Printf("in %v's ticker\n", rf.me)
 	for rf.killed() == false {
 		// Your code here (2A)
 		rf.mu.Lock()
 		if rf.needNextElectionNoneLock() {
-			fmt.Printf("%v become candidate\n", rf.me)
 			for {
 				rf.becomeCandidateNoneLock()
 				rf.sendVoteReqToAllPeerNoneLock()
@@ -846,7 +840,6 @@ func (rf *Raft) ticker() {
 					}
 					if rf.state == Candidate {
 						if rf.voteGet >= (len(rf.peers)+1)/2 {
-							fmt.Printf("%v become leader\n", rf.me)
 							rf.state = Leader
 							rf.convertToLeaderConfigNoneLock()
 							go rf.sendHeartBeatLoop(rf.term)
