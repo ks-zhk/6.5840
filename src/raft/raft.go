@@ -80,6 +80,7 @@ type Raft struct {
 	nextIndex     []int
 	matchIndex    []int
 	CallerApplyCh chan ApplyMsg
+	heartBeatChan chan int
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -793,6 +794,33 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 		} else {
 			DPrintf("[%v][%v] get vote, however state is not candidate\n", rf.me, rf.term)
 		}
+	}
+	return
+}
+func (rf *Raft) sendHeartBeatAliveLoop(term int) {
+
+	for rf.killed() == false {
+		if !rf.isLeaderWithLock() {
+			break
+		}
+		for idx, _ := range rf.peers {
+			if idx == rf.me {
+				continue
+			}
+			if !rf.lockWithCheckForLeader(term) {
+				return
+			}
+			_, err := rf.getHeartBeatMsgNoneLock(idx)
+			if err != nil {
+				rf.mu.Unlock()
+				break
+			}
+			hb := reqWarp{Req: RequestAppendEntries{}, Msg: HeartBeat}
+			rf.applyCh[idx] <- hb
+			rf.mu.Unlock()
+		}
+		ms := 100 + (rand.Int63() % 15)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	return
 }
