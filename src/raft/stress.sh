@@ -18,12 +18,13 @@ if [[ -z $NUM_RUNS || -z $TEST_COMMAND ]]; then
   echo "请提供循环次数和执行命令版本作为参数！"
   exit 1
 fi
-
+rm -rf test_log
+go env -w GOPROXY=https://goproxy.cn,direct
 # 循环运行测试程序
 for ((i=1; i<=NUM_RUNS; i++)); do
   # 运行测试程序
   output=$(go test -run $TEST_COMMAND -race 2>&1)
-
+  echo "${output}" >> test_log
   # 检查输出中是否包含 "FAIL" 字符串
   if [[ $output == *"FAIL"* ]]; then
     fail_found=true
