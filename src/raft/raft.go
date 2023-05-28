@@ -273,9 +273,9 @@ func (rf *Raft) sendVoteReqToAllPeerNoneLock() {
 		}
 		req := rf.getVoteReqArgsNoneLock()
 		var reply RequestVoteReply
-		go func(req RequestVoteArgs, reply RequestVoteReply, idx int) {
-			rf.sendRequestVote(idx, &req, &reply, rf.term)
-		}(req, reply, idx)
+		go func(req RequestVoteArgs, reply RequestVoteReply, idx int, term int) {
+			rf.sendRequestVote(idx, &req, &reply, term)
+		}(req, reply, idx, rf.term)
 	}
 }
 func (rf *Raft) becomeCandidateNoneLock() {
