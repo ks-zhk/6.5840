@@ -367,8 +367,8 @@ type ReplyAppendEntries struct {
 
 func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntries) {
 	rf.mu.Lock()
-	defer DPrintf("[%v] logs = %v\n", rf.me, rf.logs)
 	defer rf.mu.Unlock()
+	defer DPrintf("[%v] logs = %v\n", rf.me, rf.logs)
 	if args.Term > rf.term {
 		DPrintf("[%v] get append req, but the term is big\n", rf.me)
 		rf.convertToFollowerNoneLock(args.Term)
@@ -392,9 +392,8 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 					break
 				}
 			}
-			if i < args.PrevLogIndex+len(args.Entries) {
-				rf.logs = rf.logs[:i]
-			}
+			// TODO: 直接清空
+			rf.logs = rf.logs[:i]
 			for _, log := range args.Entries[i-args.PrevLogIndex:] {
 				rf.logs = append(rf.logs, log)
 			}
@@ -439,9 +438,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 				break
 			}
 		}
-		if i < args.PrevLogIndex+len(args.Entries) {
-			rf.logs = rf.logs[:i]
-		}
+		rf.logs = rf.logs[:i]
 		for _, log := range args.Entries[i-args.PrevLogIndex:] {
 			rf.logs = append(rf.logs, log)
 			//rf.CallerApplyCh <- ApplyMsg{
@@ -864,8 +861,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 	rf.mu.Lock()
-	defer DPrintf("[%v] logs = %v\n", rf.me, rf.logs)
 	defer rf.mu.Unlock()
+	defer DPrintf("[%v] logs = %v\n", rf.me, rf.logs)
 	isLeader = rf.state == Leader
 	if !isLeader || rf.killed() {
 		return index, term, isLeader
