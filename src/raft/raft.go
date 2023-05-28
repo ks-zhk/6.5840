@@ -19,7 +19,6 @@ package raft
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 
 	//	"bytes"
@@ -370,11 +369,11 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.term {
-		fmt.Printf("%v get append req, but the term is big\n", rf.me)
+		// fmt.Printf("%v get append req, but the term is big\n", rf.me)
 		rf.convertToFollowerNoneLock(args.Term)
 	}
 	if args.Term < rf.term {
-		fmt.Printf("%v get append req, but the term is small\n", rf.me)
+		// fmt.Printf("%v get append req, but the term is small\n", rf.me)
 		reply.Term = rf.term
 		reply.Success = false
 		return
@@ -385,7 +384,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 		// 特殊情况特殊讨论
 		if args.PrevLogIndex == 0 {
 			// 最特殊的情况, 直接无脑加log即可
-			fmt.Printf("in it\n")
+			// fmt.Printf("in it\n")
 			var i int
 			for i = args.PrevLogIndex; i < args.PrevLogIndex+len(args.Entries) && i < len(rf.logs); i++ {
 				if rf.logs[i].Term != args.Entries[i-args.PrevLogIndex].Term {
@@ -426,7 +425,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 				}
 			}
 			reply.Success = true
-			fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
+			// fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
 			return
 		}
 		if len(rf.logs) < args.PrevLogIndex {
@@ -486,7 +485,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 		// leader
 		reply.Success = false
 	}
-	fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
+	// fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
 	return
 }
 
@@ -521,11 +520,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if !rf.hasVoted {
 				if args.LastLogTerm < rf.getLastLogTermNoneLock() {
 					reply.Voted = false
-					fmt.Println("deny!!")
+					// fmt.Println("deny!!")
 				} else if args.LastLogTerm == rf.getLastLogTermNoneLock() {
 					if len(rf.logs) > args.LastLogIndex {
 						reply.Voted = false
-						fmt.Println("deny!!")
+						// fmt.Println("deny!!")
 					} else {
 						rf.hasVoted = true
 						reply.Voted = true
@@ -535,7 +534,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 					reply.Voted = true
 				}
 			} else {
-				fmt.Println("deny!!")
+				// fmt.Println("deny!!")
 				reply.Voted = false
 			}
 		}
@@ -639,11 +638,13 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				return
 			}
 			// 相等验证
-			fmt.Printf("%v in first call, msg = %v\n", rf.me, msg)
+			// fmt.Printf("%v in first call, msg = %v\n", rf.me, msg)
 			rf.mu.Unlock()
+			//fmt.Println("in line 644")
+			reply = ReplyAppendEntries{}
 			res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
 		}
-		fmt.Printf("%v reply = %v\n", rf.me, reply)
+		// fmt.Printf("%v reply = %v\n", rf.me, reply)
 		rf.onGetMsgWithLock()
 		for reply.Success == false {
 			// decrease
@@ -659,11 +660,11 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				rf.mu.Unlock()
 				break
 			}
-			fmt.Printf("%v now term is %v\n", rf.me, rf.term)
-			fmt.Printf("%v nextIndex[%v] = %v\n", rf.me, peerId, rf.nextIndex[peerId])
+			// fmt.Printf("%v now term is %v\n", rf.me, rf.term)
+			// fmt.Printf("%v nextIndex[%v] = %v\n", rf.me, peerId, rf.nextIndex[peerId])
 			rf.nextIndex[peerId] -= 1
 			hReq, err := rf.getHeartBeatMsgNoneLock(peerId)
-			fmt.Println(hReq)
+			// fmt.Println(hReq)
 			if err != nil {
 				rf.mu.Unlock()
 				return
@@ -673,7 +674,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			msg.Req.PrevLogIndex = hReq.PrevLogIndex
 			msg.Req.LeaderId = rf.me
 			msg.Req.LeaderCommit = hReq.LeaderCommit
-			fmt.Printf("%v's log %v\n", rf.me, rf.logs)
+			// fmt.Printf("%v's log %v\n", rf.me, rf.logs)
 			msg.Req.Entries = append([]Entry{rf.logs[rf.nextIndex[peerId]-1]}, msg.Req.Entries...)
 			//fmt.Println(msg)
 			rf.mu.Unlock()
@@ -683,9 +684,11 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 					return
 				}
 				rf.mu.Unlock()
+				//fmt.Println("in line 687")
+				reply = ReplyAppendEntries{}
 				res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
 			}
-			fmt.Println("ok")
+			// fmt.Println("ok")
 			rf.onGetMsgWithLock()
 		}
 		if !rf.lockWithCheckForLeader(term) {
@@ -700,7 +703,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			rf.mu.Unlock()
 			continue
 		}
-		fmt.Printf("LEADER %v's log %v\n", rf.me, rf.logs)
+		// fmt.Printf("LEADER %v's log %v\n", rf.me, rf.logs)
 		rf.matchIndex[peerId] = msg.Req.PrevLogIndex + len(msg.Req.Entries)
 		rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
 		// 找到最低的那个， 二分，线性
@@ -764,6 +767,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+	//fmt.Println("in line 769")
 	_ = rf.peers[server].Call("Raft.RequestVote", args, reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -804,7 +808,7 @@ func (rf *Raft) sendHeartBeatLoop(term int) {
 			rf.applyCh[idx] <- hb
 			rf.mu.Unlock()
 		}
-		ms := 100 + (rand.Int63() % 10)
+		ms := 100 + (rand.Int63() % 40)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	return
