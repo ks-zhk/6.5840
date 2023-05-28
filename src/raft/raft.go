@@ -233,7 +233,7 @@ func (rf *Raft) needNextElectionNoneLock() bool {
 	var res bool
 	res = rf.getMsg
 	rf.getMsg = false
-	return res == false
+	return res == false && rf.state != Leader
 }
 func (rf *Raft) onGetVote() int {
 	var res int
