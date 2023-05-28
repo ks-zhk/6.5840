@@ -971,7 +971,7 @@ func (rf *Raft) ticker() {
 				rf.sendVoteReqToAllPeerNoneLock()
 				rf.mu.Unlock()
 				finish := false
-				newTimeout := 150 + (rand.Int63() % 300)
+				newTimeout := 300 + (rand.Int63() % 250)
 				var cost int64 = 0
 				for {
 					rf.mu.Lock()
