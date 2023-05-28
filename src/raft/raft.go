@@ -635,8 +635,8 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			if !rf.lockWithCheckForLeader(term) {
 				return
 			}
-			DPrintf("[%v] try send append req to %v, with req = %v\n", rf.me, peerId, msg)
 			msg.Req.LeaderCommit = rf.commitIndex
+			DPrintf("[%v] try send append req to %v, with req = %v\n", rf.me, peerId, msg)
 			rf.mu.Unlock()
 			reply = ReplyAppendEntries{}
 			res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
@@ -681,8 +681,8 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				if !rf.lockWithCheckForLeader(term) {
 					return
 				}
-				DPrintf("[%v] try send append req to %v, with req = %v\n", rf.me, peerId, msg)
 				msg.Req.LeaderCommit = rf.commitIndex
+				DPrintf("[%v] try send append req to %v, with req = %v\n", rf.me, peerId, msg)
 				rf.mu.Unlock()
 				//fmt.Println("in line 687")
 				reply = ReplyAppendEntries{}
