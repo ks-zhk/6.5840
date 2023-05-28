@@ -643,13 +643,13 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			reply = ReplyAppendEntries{}
 			res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
 		}
-		DPrintf("[%v][%v] get reply = %v\n", rf.me, rf.term, reply)
 		rf.onGetMsgWithLock()
 		for reply.Success == false {
 			// decrease
 			if !rf.lockWithCheckForLeader(term) {
 				return
 			}
+			DPrintf("[%v][%v] get reply = %v\n", rf.me, rf.term, reply)
 			if reply.Term > rf.term {
 				rf.convertToFollowerNoneLock(reply.Term)
 				rf.mu.Unlock()
