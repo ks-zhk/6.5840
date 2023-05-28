@@ -872,9 +872,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	DPrintf("[%v][%v] get a command = %v\n", rf.me, rf.term, command)
 	defer rf.mu.Unlock()
-	defer DPrintf("[%v][%v] logs = %v\n", rf.me, rf.term, rf.logs)
+	defer DPrintf("[%v][%v] in start defer logs = %v\n", rf.me, rf.term, rf.logs)
 	isLeader = rf.state == Leader
 	if !isLeader || rf.killed() {
+		DPrintf("[%v][%v] is not leader, return false\n", rf.me, rf.term)
 		return index, term, isLeader
 	}
 	// Your code here (2B).
