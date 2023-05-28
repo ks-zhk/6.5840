@@ -522,12 +522,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 						DPrintf("[%v][%v] deny %v's vote request for same term but log is not longer\n", rf.me, rf.term, args.CandidateId)
 						// fmt.Println("deny!!")
 					} else {
-						DPrintf("[%v][%v] vote for %v\n", rf.me, args.CandidateId)
+						DPrintf("[%v][%v] vote for %v\n", rf.me, rf.term, args.CandidateId)
 						rf.hasVoted = true
 						reply.Voted = true
 					}
 				} else {
-					DPrintf("[%v][%v] vote for %v\n", rf.me, args.CandidateId)
+					DPrintf("[%v][%v] vote for %v\n", rf.me, rf.term, args.CandidateId)
 					rf.hasVoted = true
 					reply.Voted = true
 				}
