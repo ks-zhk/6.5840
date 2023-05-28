@@ -484,7 +484,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 }
 
 func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
-	DPrintf("[%v][%v] become candidate with new term %v\n", rf.me, rf.term, newTerm)
+	DPrintf("[%v][%v] become follower with new term %v\n", rf.me, rf.term, newTerm)
 	rf.term = newTerm
 	rf.state = Follower
 	rf.hasVoted = false
@@ -870,6 +870,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 	rf.mu.Lock()
+	DPrintf("[%v][%v] get a command = %v\n", rf.me, rf.term, command)
 	defer rf.mu.Unlock()
 	defer DPrintf("[%v][%v] logs = %v\n", rf.me, rf.term, rf.logs)
 	isLeader = rf.state == Leader
