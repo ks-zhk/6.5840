@@ -138,6 +138,7 @@ func (rf *Raft) onGetMsgWithLock() {
 	rf.getMsg = true
 }
 func (rf *Raft) convertToLeaderConfigNoneLock() {
+	DPrintf("[%v][%v] become leader\n", rf.me, rf.term)
 	for i := 0; i < len(rf.nextIndex); i++ {
 		rf.nextIndex[i] = len(rf.logs) + 1
 		rf.matchIndex[i] = 0
@@ -145,7 +146,6 @@ func (rf *Raft) convertToLeaderConfigNoneLock() {
 		rf.applyCh[i] = make(chan reqWarp, 10000)
 		go rf.onePeerOneChannel(i, rf.term)
 	}
-
 }
 func (rf *Raft) PrevEntryInfo() (prevLogTerm int, PrevLogIndex int) {
 	if len(rf.logs) == 0 {
@@ -274,7 +274,7 @@ func (rf *Raft) sendVoteReqToAllPeerNoneLock() {
 		req := rf.getVoteReqArgsNoneLock()
 		var reply RequestVoteReply
 		go func(req RequestVoteArgs, reply RequestVoteReply, idx int) {
-			rf.sendRequestVote(idx, &req, &reply)
+			rf.sendRequestVote(idx, &req, &reply, rf.term)
 		}(req, reply, idx)
 	}
 }
@@ -284,6 +284,7 @@ func (rf *Raft) becomeCandidateNoneLock() {
 	rf.getMsg = false
 	rf.hasVoted = true
 	rf.voteGet = 1
+	DPrintf("[%v][%v] become candidate\n", rf.me, rf.term)
 }
 
 // save Raft's persistent state to stable storage,
@@ -368,13 +369,13 @@ type ReplyAppendEntries struct {
 func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntries) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("[%v] logs = %v\n", rf.me, rf.logs)
+	defer DPrintf("[%v][%v] logs = %v\n", rf.me, rf.term, rf.logs)
 	if args.Term > rf.term {
-		DPrintf("[%v] get append req, but the term is big\n", rf.me)
+		DPrintf("[%v][%v] get append req, but the term is big\n", rf.me, rf.term)
 		rf.convertToFollowerNoneLock(args.Term)
 	}
 	if args.Term < rf.term {
-		DPrintf("[%v] get append req, but the term is small\n", rf.me)
+		DPrintf("[%v][%v] get append req, but the term is small\n", rf.me, rf.term)
 		reply.Term = rf.term
 		reply.Success = false
 		return
@@ -483,6 +484,7 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 }
 
 func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
+	DPrintf("[%v][%v] become candidate with new term %v\n", rf.me, rf.term, newTerm)
 	rf.term = newTerm
 	rf.state = Follower
 	rf.hasVoted = false
@@ -513,22 +515,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if !rf.hasVoted {
 				if args.LastLogTerm < rf.getLastLogTermNoneLock() {
 					reply.Voted = false
-					DPrintf("[%v] deny %v's vote request for last log term is not at least up-to-date\n", rf.me, args.CandidateId)
+					DPrintf("[%v][%v] deny %v's vote request for last log term is not at least up-to-date\n", rf.me, rf.term, args.CandidateId)
 				} else if args.LastLogTerm == rf.getLastLogTermNoneLock() {
 					if len(rf.logs) > args.LastLogIndex {
 						reply.Voted = false
-						DPrintf("[%v] deny %v's vote request for same term but log is not longer\n", rf.me, args.CandidateId)
+						DPrintf("[%v][%v] deny %v's vote request for same term but log is not longer\n", rf.me, rf.term, args.CandidateId)
 						// fmt.Println("deny!!")
 					} else {
+						DPrintf("[%v][%v] vote for %v\n", rf.me, args.CandidateId)
 						rf.hasVoted = true
 						reply.Voted = true
 					}
 				} else {
+					DPrintf("[%v][%v] vote for %v\n", rf.me, args.CandidateId)
 					rf.hasVoted = true
 					reply.Voted = true
 				}
 			} else {
 				// fmt.Println("deny!!")
+				DPrintf("[%v][%v] deny for %v because of hasBeen voted\n", rf.me, rf.term, args.CandidateId)
 				reply.Voted = false
 			}
 		}
@@ -633,12 +638,12 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				return
 			}
 			msg.Req.LeaderCommit = rf.commitIndex
-			DPrintf("[%v] try send append req to %v, with req = %v\n", rf.me, peerId, msg)
+			DPrintf("[%v][%v] try send append req to %v, with req = %v\n", rf.me, rf.term, peerId, msg)
 			rf.mu.Unlock()
 			reply = ReplyAppendEntries{}
 			res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
 		}
-		DPrintf("[%v] get reply = %v\n", rf.me, reply)
+		DPrintf("[%v][%v] get reply = %v\n", rf.me, rf.term, reply)
 		rf.onGetMsgWithLock()
 		for reply.Success == false {
 			// decrease
@@ -657,7 +662,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			// fmt.Printf("%v now term is %v\n", rf.me, rf.term)
 			// fmt.Printf("%v nextIndex[%v] = %v\n", rf.me, peerId, rf.nextIndex[peerId])
 			rf.nextIndex[peerId] -= 1
-			DPrintf("[%v] decrease the nextIndex of %v\n", rf.me, peerId)
+			DPrintf("[%v][%v] decrease the nextIndex of %v\n", rf.me, rf.term, peerId)
 			hReq, err := rf.getHeartBeatMsgNoneLock(peerId)
 			// fmt.Println(hReq)
 			if err != nil {
@@ -679,7 +684,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 					return
 				}
 				msg.Req.LeaderCommit = rf.commitIndex
-				DPrintf("[%v] try send append req to %v, with req = %v\n", rf.me, peerId, msg)
+				DPrintf("[%v][%v] try send append req to %v, with req = %v\n", rf.me, rf.term, peerId, msg)
 				rf.mu.Unlock()
 				//fmt.Println("in line 687")
 				reply = ReplyAppendEntries{}
@@ -704,7 +709,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 		// fmt.Printf("LEADER %v's log %v\n", rf.me, rf.logs)
 		rf.matchIndex[peerId] = msg.Req.PrevLogIndex + len(msg.Req.Entries)
 		rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
-		DPrintf("[%v] receive success append apply from %v, nextIndex = %v, matchIndex = %v\n", rf.me, peerId, rf.nextIndex[peerId], rf.matchIndex[peerId])
+		DPrintf("[%v][%v] receive success append apply from %v, nextIndex = %v, matchIndex = %v\n", rf.me, rf.term, peerId, rf.nextIndex[peerId], rf.matchIndex[peerId])
 		// 找到最低的那个， 二分，线性
 		// 二分答案：有点懒得写。。。
 		// 线性优化：从最高的开始找，尝试找到最大的那个，最高的开始也容易找到与当前term相同的,找到就可以直接break了
@@ -719,7 +724,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			}
 			if cnt >= (len(rf.peers)+1)/2 && rf.logs[n-1].Term == rf.term {
 				for i := rf.commitIndex + 1; i <= n; i++ {
-					DPrintf("[%v] commit log = %v\n", rf.me, rf.logs[i-1])
+					DPrintf("[%v][%v] commit log = %v\n", rf.me, rf.term, rf.logs[i-1])
 					rf.CallerApplyCh <- ApplyMsg{
 						CommandValid: true,
 						Command:      rf.logs[i-1].Command,
@@ -766,9 +771,10 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *RequestVoteReply, term int) {
 	//fmt.Println("in line 769")
-	_ = rf.peers[server].Call("Raft.RequestVote", args, reply)
+	var reply RequestVoteReply
+	_ = rf.peers[server].Call("Raft.RequestVote", args, &reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.Term < rf.term {
@@ -778,11 +784,14 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		rf.convertToFollowerNoneLock(reply.Term)
 		return
 	}
+	if rf.term != term {
+		return
+	}
 	if reply.Voted {
 		if rf.state == Candidate {
 			rf.voteGet += 1
 		} else {
-			DPrintf("get vote, however state is not candidate")
+			DPrintf("[%v][%v] get vote, however state is not candidate\n", rf.me, rf.term)
 		}
 	}
 	return
@@ -808,7 +817,7 @@ func (rf *Raft) sendHeartBeatLoop(term int) {
 			rf.applyCh[idx] <- hb
 			rf.mu.Unlock()
 		}
-		ms := 100 + (rand.Int63() % 50)
+		ms := 100 + (rand.Int63() % 15)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	return
@@ -862,7 +871,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("[%v] logs = %v\n", rf.me, rf.logs)
+	defer DPrintf("[%v][%v] logs = %v\n", rf.me, rf.term, rf.logs)
 	isLeader = rf.state == Leader
 	if !isLeader || rf.killed() {
 		return index, term, isLeader
@@ -955,8 +964,6 @@ func (rf *Raft) ticker() {
 		//fmt.Printf("%v tick\n", rf.me)
 		if rf.needNextElectionNoneLock() {
 			for {
-				DPrintf("[%v] become candidate\n", rf.me)
-				// fmt.Printf("%v timeout, become candidate\n", rf.me)
 				rf.becomeCandidateNoneLock()
 				rf.sendVoteReqToAllPeerNoneLock()
 				rf.mu.Unlock()
@@ -975,11 +982,10 @@ func (rf *Raft) ticker() {
 							rf.convertToLeaderConfigNoneLock()
 							go rf.sendHeartBeatLoop(rf.term)
 							finish = true
-							DPrintf("[%v] become leader\n", rf.me)
+							//DPrintf("[%v][%v] become leader\n", rf.me, rf.term)
 							break
 						}
 					} else if rf.state == Follower {
-						DPrintf("[%v] become follower\n", rf.me)
 						finish = true
 						break
 					} else {
