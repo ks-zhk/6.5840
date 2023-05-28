@@ -367,6 +367,7 @@ type ReplyAppendEntries struct {
 
 func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntries) {
 	rf.mu.Lock()
+	defer DPrintf("[%v] logs = %v\n", rf.me, rf.logs)
 	defer rf.mu.Unlock()
 	if args.Term > rf.term {
 		DPrintf("[%v] get append req, but the term is big\n", rf.me)
@@ -863,6 +864,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 	rf.mu.Lock()
+	defer DPrintf("[%v] logs = %v\n", rf.me, rf.logs)
 	defer rf.mu.Unlock()
 	isLeader = rf.state == Leader
 	if !isLeader || rf.killed() {
