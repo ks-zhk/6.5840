@@ -30,7 +30,7 @@ for ((i=1; i<=NUM_RUNS; i++)); do
     fail_found=true
     break
   fi
-
+  rm -rf test_log
   # 更新计数器
   counter=$((counter + 1))
 
