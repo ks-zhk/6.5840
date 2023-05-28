@@ -884,6 +884,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   len(rf.logs) + 1,
 		Command: command,
 	})
+	DPrintf("[%v][%v] in start inside logs = %v\n", rf.me, rf.term, rf.logs)
 	rf.matchIndex[rf.me] = len(rf.logs)
 	//rf.CallerApplyCh <- ApplyMsg{
 	//	CommandValid: true,
@@ -1028,6 +1029,8 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
