@@ -1,0 +1,12 @@
+LAB2-C
+
+1. 需要保存哪些状态？
+ + term
+ + voteGet
+ + state
+ + hasVoted
+ + logs
+2. 当Make时，需要根据状态，进行哪些恢复？
+ + send Heart Beat恢复（如果为leader，需要发送heart beat信息）
+ + 如果为candidate，需要重新发起投票（重复获取投票其实无所谓的，幂等）
+ + 如果为follower，啥都不干就对了。

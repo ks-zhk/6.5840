@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"errors"
 	"sync"
 
@@ -65,7 +67,7 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// below is (2A)
-	term              int   // current term, or latest term server has seen. initial is 0 on first boot
+	term              int   // current term, or latest term server has seen. initial is 0 on first boot, need
 	state             State // current state, [leader, follower, candidate]
 	voteGet           int   // when in candidate, and only in candidate state, this value is valid, means vote get from follower
 	hasVoted          bool  // only when in follower state is valid. every time when term update, the hasVote will reset to false
@@ -307,6 +309,17 @@ func (rf *Raft) persist() {
 	// rf.persister.Save(raftstate, nil)
 }
 
+// 其实应该使用temp file，然后atomic存储，从而防止不一致性。
+func (rf *Raft) persistNoneLock() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.voteGet)
+	e.Encode(rf.logs)
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, nil)
+}
+
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -325,6 +338,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(r)
+	var term int
+	var voteGet int
+	var logs []Entry
+	if decoder.Decode(&term) != nil ||
+		decoder.Decode(&voteGet) != nil ||
+		decoder.Decode(&logs) != nil {
+		panic("decode error")
+	} else {
+		rf.term = term
+		rf.logs = logs
+		rf.voteGet = voteGet
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -1042,7 +1069,7 @@ func (rf *Raft) ticker() {
 			rf.sendVoteReqToAllPeerNoneLock(rf.term)
 		}
 		rf.mu.Unlock()
-		ms := 150 + (rand.Int63() % 300)
+		ms := 200 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
