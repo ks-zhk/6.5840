@@ -77,11 +77,10 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	nextIndex         []int
-	matchIndex        []int
-	CallerApplyCh     chan ApplyMsg
-	heartBeatChan     chan int
-	lastHeartBeatTime time.Time
+	nextIndex     []int
+	matchIndex    []int
+	CallerApplyCh chan ApplyMsg
+	heartBeatChan chan int
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -1041,50 +1040,6 @@ func (rf *Raft) ticker() {
 		if rf.needNextElectionNoneLock() {
 			rf.becomeCandidateNoneLock()
 			rf.sendVoteReqToAllPeerNoneLock(rf.term)
-			//for {
-			//	rf.becomeCandidateNoneLock()
-			//	rf.sendVoteReqToAllPeerNoneLock(rf.term)
-			//	rf.mu.Unlock()
-			//	finish := false
-			//	newTimeout := 300 + (rand.Int63() % 250)
-			//	var cost int64 = 0
-			//	for {
-			//		rf.mu.Lock()
-			//		if rf.killed() {
-			//			rf.mu.Unlock()
-			//			return
-			//		}
-			//		if rf.state == Candidate {
-			//			if rf.voteGet >= (len(rf.peers)+1)/2 {
-			//				rf.state = Leader
-			//				rf.convertToLeaderConfigNoneLock()
-			//				go rf.sendHeartBeatLoop(rf.term)
-			//				finish = true
-			//				//DPrintf("[%v][%v] become leader\n", rf.me, rf.term)
-			//				break
-			//			}
-			//		} else if rf.state == Follower {
-			//			finish = true
-			//			break
-			//		} else {
-			//			panic("leader???")
-			//		}
-			//		rf.mu.Unlock()
-			//		// 10毫秒检测一次
-			//		time.Sleep(time.Duration(10) * time.Millisecond)
-			//		cost += 10
-			//		if rf.killed() {
-			//			return
-			//		}
-			//		if cost > newTimeout {
-			//			break
-			//		}
-			//	}
-			//	if finish {
-			//		break
-			//	}
-			//	rf.mu.Lock()
-			//}
 		}
 		rf.mu.Unlock()
 		ms := 150 + (rand.Int63() % 300)
@@ -1130,7 +1085,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.term = 0
 	rf.dead = 0
 	rf.CallerApplyCh = applyCh
-	rf.lastHeartBeatTime = time.Now()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	// start heart beat loop

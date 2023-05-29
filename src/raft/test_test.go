@@ -192,7 +192,7 @@ func TestFollowerFailure2B(t *testing.T) {
 	// disconnect one follower from the network.
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 1) % servers)
-	fmt.Printf("disconnect %v\n", (leader1+1)%servers)
+	//fmt.Printf("disconnect %v\n", (leader1+1)%servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
@@ -529,12 +529,12 @@ func TestBackup2B(t *testing.T) {
 	//fmt.Println("here!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
-	fmt.Printf("leader 2 = %v\n", leader2)
+	//fmt.Printf("leader 2 = %v\n", leader2)
 	other := (leader1 + 2) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
-	fmt.Printf("other = %v\n", other)
+	//fmt.Printf("other = %v\n", other)
 	cfg.disconnect(other)
 	//fmt.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!????????????????????????????????????")
 	// lots more commands that won't commit
