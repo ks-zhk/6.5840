@@ -6,6 +6,7 @@ NUM_RUNS=$1
 # 从命令行参数获取执行命令版本
 TEST_COMMAND=$2
 
+KEY_WORD=$3
 # 初始化计数器和失败标志
 counter=0
 fail_found=false
@@ -24,7 +25,7 @@ go env -w GOPROXY=https://goproxy.cn,direct
 for ((i=1; i<=NUM_RUNS; i++)); do
   # 运行测试程序
   output=$(go test -run $TEST_COMMAND -race 2>&1)
-  echo "${output}" >> test_log
+  echo "${output}" >> "test_log${KEY_WORD}"
   # 检查输出中是否包含 "FAIL" 字符串
   if [[ $output == *"FAIL"* ]]; then
     fail_found=true
