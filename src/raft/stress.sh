@@ -19,7 +19,7 @@ if [[ -z $NUM_RUNS || -z $TEST_COMMAND ]]; then
   echo "请提供循环次数和执行命令版本作为参数！"
   exit 1
 fi
-rm -rf test_log
+rm -rf "test_log${KEY_WORD}"
 go env -w GOPROXY=https://goproxy.cn,direct
 # 循环运行测试程序
 for ((i=1; i<=NUM_RUNS; i++)); do
@@ -31,7 +31,7 @@ for ((i=1; i<=NUM_RUNS; i++)); do
     fail_found=true
     break
   fi
-  rm -rf test_log
+  rm -rf "test_log${KEY_WORD}"
   # 更新计数器
   counter=$((counter + 1))
 
