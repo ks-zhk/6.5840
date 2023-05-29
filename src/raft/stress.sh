@@ -27,7 +27,7 @@ for ((i=1; i<=NUM_RUNS; i++)); do
   output=$(go test -run $TEST_COMMAND -race 2>&1)
   echo "${output}" >> "test_log${KEY_WORD}"
   # 检查输出中是否包含 "FAIL" 字符串
-  if [[ $output == *"FAIL"* ]]; then
+  if [[ $output == *"FAIL	6.5840/raft"* ]]; then
     fail_found=true
     break
   fi

@@ -1114,6 +1114,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.CallerApplyCh = applyCh
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	if rf.state == Candidate {
+		rf.sendVoteReqToAllPeerNoneLock(rf.term)
+	} else if rf.state == Leader {
+		rf.convertToLeaderConfigNoneLock()
+	}
 	// start heart beat loop
 	go rf.sendHeartBeatAliveLoop()
 	// start ticker goroutine to start elections
