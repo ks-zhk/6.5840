@@ -517,7 +517,7 @@ func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 	rf.term = newTerm
 	rf.state = Follower
 	rf.hasVoted = false
-	rf.getMsg = true
+	rf.getMsg = false
 	rf.voteGet = 0
 }
 
