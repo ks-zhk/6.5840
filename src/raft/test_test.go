@@ -688,18 +688,24 @@ func TestPersist12C(t *testing.T) {
 	// crash and re-start all
 	for i := 0; i < servers; i++ {
 		cfg.start1(i, cfg.applier)
+		DPrintf("[TEST] restart %v\n", i)
 	}
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
+		DPrintf("[TEST] disconnect %v\n", i)
 		cfg.connect(i)
+		DPrintf("[TEST] reconnect %v\n", i)
 	}
 
 	cfg.one(12, servers, true)
 
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	DPrintf("[TEST] disconnect %v\n", leader1)
 	cfg.start1(leader1, cfg.applier)
+	DPrintf("[TEST] restart %v\n", leader1)
 	cfg.connect(leader1)
+	DPrintf("[TEST] reconnect %v\n", leader1)
 
 	cfg.one(13, servers, true)
 
@@ -912,7 +918,6 @@ func TestFigure8Unreliable2C(t *testing.T) {
 				leader = i
 			}
 		}
-
 		if (rand.Int() % 1000) < 100 {
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
