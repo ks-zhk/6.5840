@@ -970,7 +970,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 	}
 	if reply.Voted {
 		if rf.state == Candidate {
-			DPrintf("[%v][%v] now has voted = %v\n", rf.me, rf.term, rf.voteGet)
+			DPrintf("[%v][%v] get vote from %v, now has voted = %v\n", rf.me, rf.term, server, rf.voteGet)
 			rf.voteGet += 1
 			if rf.voteGet >= (len(rf.peers)+1)/2 {
 				rf.state = Leader
