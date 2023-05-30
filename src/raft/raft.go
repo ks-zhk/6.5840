@@ -774,7 +774,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			if !rf.lockWithCheckForLeader(term) {
 				return
 			}
-			DPrintf("[%v][%v] get reply = %v\n", rf.me, rf.term, reply)
+			DPrintf("[%v][%v] get reply from [%v] = %v\n", rf.me, rf.term, peerId, reply)
 			if reply.Term > rf.term {
 				rf.convertToFollowerNoneLock(reply.Term)
 				rf.mu.Unlock()
