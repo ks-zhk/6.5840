@@ -135,11 +135,12 @@ func (rf *Raft) initOfAllServerNoneLock() {
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 }
-func (rf *Raft) onGetMsgWithLock() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.getMsg = true
-}
+
+//	func (rf *Raft) onGetMsgWithLock() {
+//		rf.mu.Lock()
+//		defer rf.mu.Unlock()
+//		rf.getMsg = true
+//	}
 func (rf *Raft) convertToLeaderConfigNoneLock() {
 	DPrintf("[%v][%v] become leader\n", rf.me, rf.term)
 	for i := 0; i < len(rf.nextIndex); i++ {
@@ -206,35 +207,38 @@ func (rf *Raft) isLeaderWithLock() bool {
 	rf.mu.Unlock()
 	return res
 }
-func (rf *Raft) resetTimeout() {
-	rf.mu.Lock()
-	rf.getMsg = false
-	rf.mu.Unlock()
-}
-func (rf *Raft) noNeedNextElection() bool {
-	var res bool
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	res = rf.getMsg
-	if rf.state == Candidate {
-		// 如果仍然是candidate, 那么表示本次选举失败，应该进行下一次选举
-		res = false
-		return res
-	}
-	rf.getMsg = false
-	return res
-}
-func (rf *Raft) noNeedNextElectionNoneLock() bool {
-	var res bool
-	res = rf.getMsg
-	if rf.state == Candidate {
-		// 如果仍然是candidate, 那么表示本次选举失败，应该进行下一次选举
-		res = false
-		return res
-	}
-	rf.getMsg = false
-	return res
-}
+
+//	func (rf *Raft) resetTimeout() {
+//		rf.mu.Lock()
+//		rf.getMsg = false
+//		rf.mu.Unlock()
+//	}
+//
+//	func (rf *Raft) noNeedNextElection() bool {
+//		var res bool
+//		rf.mu.Lock()
+//		defer rf.mu.Unlock()
+//		res = rf.getMsg
+//		if rf.state == Candidate {
+//			// 如果仍然是candidate, 那么表示本次选举失败，应该进行下一次选举
+//			res = false
+//			return res
+//		}
+//		rf.getMsg = false
+//		return res
+//	}
+//
+//	func (rf *Raft) noNeedNextElectionNoneLock() bool {
+//		var res bool
+//		res = rf.getMsg
+//		if rf.state == Candidate {
+//			// 如果仍然是candidate, 那么表示本次选举失败，应该进行下一次选举
+//			res = false
+//			return res
+//		}
+//		rf.getMsg = false
+//		return res
+//	}
 func (rf *Raft) needNextElectionNoneLock() bool {
 	var res bool
 	res = rf.getMsg
@@ -288,7 +292,7 @@ func (rf *Raft) sendVoteReqToAllPeerNoneLock(term int) {
 func (rf *Raft) becomeCandidateNoneLock() {
 	rf.term += 1
 	rf.state = Candidate
-	rf.getMsg = false
+	rf.getMsg = true
 	rf.hasVoted = true
 	rf.voteGet = 1
 	rf.persistNoneLock()
@@ -560,7 +564,6 @@ func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 	rf.term = newTerm
 	rf.state = Follower
 	rf.hasVoted = false
-	//rf.getMsg = false
 	rf.voteGet = 0
 	rf.persistNoneLock()
 }
@@ -765,7 +768,6 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			reply = ReplyAppendEntries{}
 			res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
 		}
-		rf.onGetMsgWithLock()
 		for reply.Success == false {
 			// decrease
 			if !rf.lockWithCheckForLeader(term) {
@@ -840,7 +842,6 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				res = rf.peers[peerId].Call("Raft.AppendEntries", &msg.Req, &reply)
 			}
 			// fmt.Println("ok")
-			rf.onGetMsgWithLock()
 		}
 		if !rf.lockWithCheckForLeader(term) {
 			return
