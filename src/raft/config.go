@@ -587,6 +587,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
+						cfg.t.Logf("[%v] success use time %v\n", cmd, time.Since(t0))
 						// and it was the command we submitted.
 						return index
 					}
@@ -601,6 +602,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 		}
 	}
 	if cfg.checkFinished() == false {
+		cfg.t.Logf("[%v] in timeout use time %v\n", cmd, time.Since(t0))
 		cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	}
 	return -1

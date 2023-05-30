@@ -432,13 +432,18 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 			// 最特殊的情况, 直接无脑加log即可
 			// fmt.Printf("in it\n")
 			var i int
+			conflict := false
 			for i = args.PrevLogIndex; i < args.PrevLogIndex+len(args.Entries) && i < len(rf.logs); i++ {
 				if rf.logs[i].Term != args.Entries[i-args.PrevLogIndex].Term {
+					conflict = true
 					break
 				}
 			}
 			// TODO: 直接清空
-			rf.logs = rf.logs[:i]
+			// 这边其实不应该考虑截断日志。
+			if conflict {
+				rf.logs = rf.logs[:i]
+			}
 			for _, log := range args.Entries[i-args.PrevLogIndex:] {
 				rf.logs = append(rf.logs, log)
 			}
@@ -493,12 +498,16 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 			return
 		}
 		var i int
+		conflict := false
 		for i = args.PrevLogIndex; i < args.PrevLogIndex+len(args.Entries) && i < len(rf.logs); i++ {
 			if rf.logs[i].Term != args.Entries[i-args.PrevLogIndex].Term {
+				conflict = true
 				break
 			}
 		}
-		rf.logs = rf.logs[:i]
+		if conflict {
+			rf.logs = rf.logs[:i]
+		}
 		for _, log := range args.Entries[i-args.PrevLogIndex:] {
 			rf.logs = append(rf.logs, log)
 			//rf.CallerApplyCh <- ApplyMsg{
@@ -651,10 +660,11 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 					return
 				}
 				if rf.nextIndex[peerId] == len(rf.logs)+1 {
+					// 相当于HeartBeat了，这种工作还是给heartBeat干吧
 					rf.mu.Unlock()
 					continue
 				}
-				entries := rf.logs[rf.nextIndex[peerId]-1:]
+				entries := rf.logs[rf.nextIndex[peerId]-1 : len(rf.logs)]
 				var prevTerm = 0
 				prevIndex := rf.nextIndex[peerId] - 1
 				if prevIndex > 0 {
@@ -683,17 +693,35 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				if !rf.lockWithCheckForLeader(term) {
 					return
 				}
-				//if nt.Sub(rf.lastHeartBeatTime) < time.Duration(10*time.Millisecond) {
-				//	rf.mu.Unlock()
-				//	continue
-				//}
-				//rf.lastHeartBeatTime = nt
-				req, err := rf.getHeartBeatMsgNoneLock(peerId)
-				if err != nil {
-					rf.mu.Unlock()
-					return
+				var entries []Entry
+				if rf.nextIndex[peerId] == len(rf.logs)+1 {
+					entries = []Entry{}
+				} else {
+					entries = rf.logs[rf.nextIndex[peerId]-1 : len(rf.logs)]
+					if len(entries) == 0 {
+						panic("entry should not be zero")
+					}
 				}
-				msg.Req = req
+				var prevTerm = 0
+				prevIndex := rf.nextIndex[peerId] - 1
+				if prevIndex > 0 {
+					prevTerm = rf.logs[prevIndex-1].Term
+				}
+				msg.Req = RequestAppendEntries{
+					Entries:      entries,
+					LeaderCommit: rf.commitIndex,
+					Term:         rf.term,
+					PrevLogIndex: prevIndex,
+					PrevLogTerm:  prevTerm,
+					// TODO: 要做redirect吗?
+					LeaderId: rf.me,
+				}
+				//req, err := rf.getHeartBeatMsgNoneLock(peerId)
+				//if err != nil {
+				//	rf.mu.Unlock()
+				//	return
+				//}
+				//msg.Req = req
 				rf.mu.Unlock()
 				break
 			}
@@ -724,6 +752,11 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				return
 			}
 			msg.Req.LeaderCommit = rf.commitIndex
+			if rf.nextIndex[peerId] == len(rf.logs)+1 {
+				msg.Req.Entries = []Entry{}
+			} else {
+				msg.Req.Entries = rf.logs[rf.nextIndex[peerId]-1:]
+			}
 			DPrintf("[%v][%v] try send append req to %v, with req = %v\n", rf.me, rf.term, peerId, msg)
 			rf.mu.Unlock()
 			reply = ReplyAppendEntries{}
@@ -752,6 +785,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				// 防止重复提交
 				rf.nextIndex[peerId] = reply.XLen + 1
 			} else {
+				//rf.nextIndex[peerId] -= 1
 				find := false
 				for i := len(rf.logs) - 1; i >= 0; i-- {
 					if rf.logs[i].Term == reply.XTerm {
@@ -790,6 +824,12 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 					return
 				}
 				msg.Req.LeaderCommit = rf.commitIndex
+				// 更新最新的append msg
+				if rf.nextIndex[peerId] == len(rf.logs)+1 {
+					msg.Req.Entries = []Entry{}
+				} else {
+					msg.Req.Entries = rf.logs[rf.nextIndex[peerId]-1:]
+				}
 				DPrintf("[%v][%v] try send append req to %v, with req = %v\n", rf.me, rf.term, peerId, msg)
 				rf.mu.Unlock()
 				//fmt.Println("in line 687")
@@ -940,7 +980,7 @@ func (rf *Raft) sendHeartBeatAliveJustLoop(term int) {
 			rf.applyCh[idx] <- hb
 		}
 		rf.mu.Unlock()
-		ms := 100 + (rand.Int63() % 20)
+		ms := 100
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
