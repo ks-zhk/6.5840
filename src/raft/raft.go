@@ -240,10 +240,7 @@ func (rf *Raft) isLeaderWithLock() bool {
 //		return res
 //	}
 func (rf *Raft) needNextElectionNoneLock() bool {
-	var res bool
-	res = rf.getMsg
-	rf.getMsg = false
-	return res == false && rf.state != Leader
+	return rf.getMsg == false && rf.state != Leader
 }
 func (rf *Raft) onGetVote() int {
 	var res int
@@ -1213,9 +1210,11 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		rf.mu.Lock()
 		//fmt.Printf("%v tick\n", rf.me)
-		if rf.needNextElectionNoneLock() {
+		if rf.getMsg == false && rf.state != Leader {
 			rf.becomeCandidateNoneLock()
 			rf.sendVoteReqToAllPeerNoneLock(rf.term)
+		} else {
+			rf.getMsg = false
 		}
 		rf.mu.Unlock()
 		ms := 200 + (rand.Int63() % 250)
