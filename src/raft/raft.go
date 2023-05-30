@@ -1216,7 +1216,7 @@ func (rf *Raft) ticker() {
 			rf.sendVoteReqToAllPeerNoneLock(rf.term)
 		}
 		rf.mu.Unlock()
-		ms := 150 + (rand.Int63() % 300)
+		ms := 200 + (rand.Int63() % 250)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
