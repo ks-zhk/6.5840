@@ -67,13 +67,14 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// below is (2A)
-	term              int   // current term, or latest term server has seen. initial is 0 on first boot, need
-	state             State // current state, [leader, follower, candidate]
-	voteGet           int   // when in candidate, and only in candidate state, this value is valid, means vote get from follower
-	hasVoted          bool  // only when in follower state is valid. every time when term update, the hasVote will reset to false
-	getMsg            bool
-	lastHeartBeatOver []bool
-	applyCh           []chan reqWarp
+	term                 int   // current term, or latest term server has seen. initial is 0 on first boot, need
+	state                State // current state, [leader, follower, candidate]
+	voteGet              int   // when in candidate, and only in candidate state, this value is valid, means vote get from follower
+	hasVoted             bool  // only when in follower state is valid. every time when term update, the hasVote will reset to false
+	lastVotedCandidateId int
+	getMsg               bool
+	lastHeartBeatOver    []bool
+	applyCh              []chan reqWarp
 	// below if (2B)
 	logs        []Entry
 	commitIndex int
@@ -323,6 +324,7 @@ func (rf *Raft) persistNoneLock() {
 	e.Encode(rf.logs)
 	e.Encode(rf.state)
 	e.Encode(rf.hasVoted)
+	e.Encode(rf.lastVotedCandidateId)
 	raftState := w.Bytes()
 	rf.persister.Save(raftState, nil)
 }
@@ -352,11 +354,13 @@ func (rf *Raft) readPersist(data []byte) {
 	var logs []Entry
 	var state State
 	var hasVoted bool
+	var lastVotedCandidateId int
 	if decoder.Decode(&term) != nil ||
 		decoder.Decode(&voteGet) != nil ||
 		decoder.Decode(&logs) != nil ||
 		decoder.Decode(&state) != nil ||
-		decoder.Decode(&hasVoted) != nil {
+		decoder.Decode(&hasVoted) != nil ||
+		decoder.Decode(&lastVotedCandidateId) != nil {
 		panic("decode error")
 	} else {
 		rf.term = term
@@ -589,29 +593,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if !rf.hasVoted {
 				if args.LastLogTerm < rf.getLastLogTermNoneLock() {
 					reply.Voted = false
+					reply.Term = rf.term
 					DPrintf("[%v][%v] deny %v's vote request for last log term is not at least up-to-date\n", rf.me, rf.term, args.CandidateId)
+					return
 				} else if args.LastLogTerm == rf.getLastLogTermNoneLock() {
 					if len(rf.logs) > args.LastLogIndex {
 						reply.Voted = false
+						reply.Term = rf.term
 						DPrintf("[%v][%v] deny %v's vote request for same term but log is not longer\n", rf.me, rf.term, args.CandidateId)
-						// fmt.Println("deny!!")
+						return
 					} else {
 						DPrintf("[%v][%v] vote for %v\n", rf.me, rf.term, args.CandidateId)
 						rf.hasVoted = true
 						reply.Voted = true
 						rf.getMsg = true
+						rf.lastVotedCandidateId = args.CandidateId
 					}
 				} else {
 					DPrintf("[%v][%v] vote for %v\n", rf.me, rf.term, args.CandidateId)
 					rf.hasVoted = true
 					reply.Voted = true
 					rf.getMsg = true
+					rf.lastVotedCandidateId = args.CandidateId
 				}
 				rf.persistNoneLock()
 			} else {
 				// fmt.Println("deny!!")
-				DPrintf("[%v][%v] deny for %v because of hasBeen voted\n", rf.me, rf.term, args.CandidateId)
-				reply.Voted = false
+				if rf.lastVotedCandidateId == args.CandidateId {
+					DPrintf("[%v][%v] vote for %v\n", rf.me, rf.term, args.CandidateId)
+					reply.Voted = true
+					rf.getMsg = true
+				} else {
+					DPrintf("[%v][%v] deny for %v because of hasBeen voted\n", rf.me, rf.term, args.CandidateId)
+					reply.Voted = false
+				}
 			}
 		}
 	case Candidate:
