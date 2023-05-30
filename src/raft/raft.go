@@ -18,10 +18,11 @@ package raft
 //
 
 import (
-	"6.5840/labgob"
 	"bytes"
 	"errors"
 	"sync"
+
+	"6.5840/labgob"
 
 	//	"bytes"
 	"math/rand"
@@ -89,6 +90,33 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 }
+
+func (rf *Raft) getNowAppendRequestNoneLock(peerId int) RequestAppendEntries {
+	var prevIndex int
+	var prevTerm int
+	if rf.nextIndex[peerId] == 1 {
+		prevIndex = 0
+		prevTerm = 0
+	} else {
+		prevIndex = rf.nextIndex[peerId] - 1
+		prevTerm = rf.logs[prevIndex-1].Term
+	}
+	var entries []Entry
+	if len(rf.logs)+1 == rf.nextIndex[peerId] {
+		entries = []Entry{}
+	} else {
+		entries = rf.logs[rf.nextIndex[peerId]-1:]
+	}
+	return RequestAppendEntries{
+		Term:         rf.term,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+}
+
 type reqWarp struct {
 	Req RequestAppendEntries
 	Msg Msg
@@ -149,7 +177,7 @@ func (rf *Raft) convertToLeaderConfigNoneLock() {
 		rf.matchIndex[i] = 0
 		rf.lastHeartBeatOver[i] = true
 		rf.applyCh[i] = make(chan reqWarp, 10000)
-		go rf.onePeerOneChannel(i, rf.term)
+		go rf.onePeerOneChannelConcurrent(i, rf.term)
 	}
 	go rf.sendHeartBeatAliveJustLoop(rf.term)
 	rf.persistNoneLock()
@@ -185,7 +213,6 @@ const (
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isLeader bool
 	rf.mu.Lock()
@@ -334,19 +361,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 	r := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(r)
 	var term int
@@ -641,30 +655,246 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.term
 	return
 }
-
-//	func (rf *Raft) HeartBeat(args *RequestAppendEntries, reply *ReplyAppendEntries) {
-//		// THINK: 状态是否会转变？
-//		rf.mu.Lock()
-//		defer rf.mu.Unlock()
-//		if args.Term < rf.term {
-//			reply.Success = false
-//		}
-//		if args.Term > rf.term {
-//			rf.convertToFollowerNoneLock(args.Term)
-//			reply.Success = true
-//		}
-//		// TODO: May Be BUG
-//		//if rf.state == Leader {
-//		//	panic("two leader!! split brain!!")
-//		//}
-//		if rf.state == Candidate {
-//			rf.convertToFollowerNoneLock(args.Term)
-//			reply.Success = true
-//		}
-//		rf.getMsg = true
-//		reply.Term = rf.term
-//		return
-//	}
+func (rf *Raft) sendAppendRequest(term int, peerId int, args RequestAppendEntries) {
+	var reply ReplyAppendEntries
+	var prevNextIndex int
+	res := false
+	for res == false {
+		if !rf.lockWithCheckForLeader(term) {
+			return
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		args = rf.getNowAppendRequestNoneLock(peerId)
+		DPrintf("[%v][%v] try send append req to %v, with req = %v\n", rf.me, rf.term, peerId, args)
+		prevNextIndex = rf.nextIndex[peerId]
+		rf.mu.Unlock()
+		reply = ReplyAppendEntries{}
+		res = rf.peers[peerId].Call("Raft.AppendEntries", &args, &reply)
+	}
+	for reply.Success == false {
+		// decrease
+		if !rf.lockWithCheckForLeader(term) {
+			return
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		DPrintf("[%v][%v] get reply from [%v] = %v\n", rf.me, rf.term, peerId, reply)
+		if reply.Term > rf.term {
+			rf.convertToFollowerNoneLock(reply.Term)
+			rf.mu.Unlock()
+			return
+		}
+		if reply.Term < rf.term {
+			rf.mu.Unlock()
+			break
+		}
+		if rf.nextIndex[peerId] == prevNextIndex {
+			last := rf.nextIndex[peerId] - 1
+			if reply.XTerm == -1 && reply.XIndex == -1 {
+				rf.nextIndex[peerId] = reply.XLen + 1
+			} else {
+				find := false
+				for i := len(rf.logs) - 1; i >= 0; i-- {
+					if rf.logs[i].Term == reply.XTerm {
+						find = true
+						rf.nextIndex[peerId] = i + 1
+						break
+					}
+				}
+				if !find {
+					rf.nextIndex[peerId] = reply.XIndex
+				}
+			}
+			hReq, err := rf.getHeartBeatMsgNoneLock(peerId)
+			if err != nil {
+				rf.mu.Unlock()
+				return
+			}
+			args.Term = hReq.Term
+			args.PrevLogTerm = hReq.PrevLogTerm
+			args.PrevLogIndex = hReq.PrevLogIndex
+			args.LeaderId = rf.me
+			args.LeaderCommit = hReq.LeaderCommit
+			// fmt.Printf("%v's log %v\n", rf.me, rf.logs)
+			for i := last; i >= rf.nextIndex[peerId]; i-- {
+				args.Entries = append([]Entry{rf.logs[i-1]}, args.Entries...)
+			}
+		}
+		rf.mu.Unlock()
+		res = false
+		for res == false {
+			if !rf.lockWithCheckForLeader(term) {
+				return
+			}
+			if rf.killed() {
+				rf.mu.Unlock()
+				return
+			}
+			args = rf.getNowAppendRequestNoneLock(peerId)
+			DPrintf("[%v][%v] try send append req to %v, with req = %v\n", rf.me, rf.term, peerId, args)
+			prevNextIndex = rf.nextIndex[peerId]
+			rf.mu.Unlock()
+			reply = ReplyAppendEntries{}
+			res = rf.peers[peerId].Call("Raft.AppendEntries", &args, &reply)
+		}
+	}
+	if !rf.lockWithCheckForLeader(term) {
+		return
+	}
+	if rf.killed() {
+		rf.mu.Unlock()
+		return
+	}
+	if reply.Term > rf.term {
+		rf.convertToFollowerNoneLock(reply.Term)
+		rf.mu.Unlock()
+		return
+	}
+	if reply.Term < rf.term {
+		rf.mu.Unlock()
+		return
+	}
+	// fmt.Printf("LEADER %v's log %v\n", rf.me, rf.logs)
+	if args.PrevLogIndex+len(args.Entries) > rf.matchIndex[peerId] {
+		rf.matchIndex[peerId] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
+	}
+	DPrintf("[%v][%v] receive success append apply from %v, nextIndex = %v, matchIndex = %v\n", rf.me, rf.term, peerId, rf.nextIndex[peerId], rf.matchIndex[peerId])
+	// 找到最低的那个， 二分，线性
+	// 二分答案：有点懒得写。。。
+	// 线性优化：从最高的开始找，尝试找到最大的那个，最高的开始也容易找到与当前term相同的,找到就可以直接break了
+	// 如果n到了commit_index，那就润喽
+	// 这边先写线性
+	for n := len(rf.logs); n > rf.commitIndex; n-- {
+		cnt := 0
+		for _, idx := range rf.matchIndex {
+			if idx >= n {
+				cnt++
+			}
+		}
+		if cnt >= (len(rf.peers)+1)/2 && rf.logs[n-1].Term == rf.term {
+			for i := rf.commitIndex + 1; i <= n; i++ {
+				//DPrintf("[%v][%v] commit log = %v\n", rf.me, rf.term, rf.logs[i-1])
+				rf.CallerApplyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[i-1].Command,
+					CommandIndex: i,
+				}
+			}
+			rf.commitIndex = n
+			break
+		}
+	}
+	rf.mu.Unlock()
+}
+func (rf *Raft) onePeerOneChannelConcurrent(peerId int, term int) {
+	rf.mu.Lock()
+	ch := rf.applyCh[peerId]
+	rf.mu.Unlock()
+	for {
+		msg, ok := <-ch
+		if !ok {
+			return
+		}
+		switch msg.Msg {
+		case Normal:
+			{
+				if !rf.lockWithCheckForLeader(term) {
+					return
+				}
+				if rf.nextIndex[peerId] == len(rf.logs)+1 {
+					// 相当于HeartBeat了，这种工作还是给heartBeat干吧
+					rf.mu.Unlock()
+					continue
+				}
+				entries := rf.logs[rf.nextIndex[peerId]-1 : len(rf.logs)]
+				var prevTerm = 0
+				prevIndex := rf.nextIndex[peerId] - 1
+				if prevIndex > 0 {
+					prevTerm = rf.logs[prevIndex-1].Term
+				}
+				msg.Req = RequestAppendEntries{
+					Entries:      entries,
+					LeaderCommit: rf.commitIndex,
+					Term:         rf.term,
+					PrevLogIndex: prevIndex,
+					PrevLogTerm:  prevTerm,
+					// TODO: 要做redirect吗?
+					LeaderId: rf.me,
+				}
+				rf.mu.Unlock()
+				break
+			}
+		case Quit:
+			{
+				return
+			}
+		case HeartBeat:
+			{
+				// 生成heart Beat操作
+				//nt := time.Now()
+				if !rf.lockWithCheckForLeader(term) {
+					return
+				}
+				var entries []Entry
+				if rf.nextIndex[peerId] == len(rf.logs)+1 {
+					entries = []Entry{}
+				} else {
+					entries = rf.logs[rf.nextIndex[peerId]-1 : len(rf.logs)]
+					if len(entries) == 0 {
+						panic("entry should not be zero")
+					}
+				}
+				var prevTerm = 0
+				prevIndex := rf.nextIndex[peerId] - 1
+				if prevIndex > 0 {
+					prevTerm = rf.logs[prevIndex-1].Term
+				}
+				msg.Req = RequestAppendEntries{
+					Entries:      entries,
+					LeaderCommit: rf.commitIndex,
+					Term:         rf.term,
+					PrevLogIndex: prevIndex,
+					PrevLogTerm:  prevTerm,
+					// TODO: 要做redirect吗?
+					LeaderId: rf.me,
+				}
+				rf.mu.Unlock()
+				break
+			}
+		case MustHeartBeat:
+			{
+				if !rf.lockWithCheckForLeader(term) {
+					return
+				}
+				req, err := rf.getHeartBeatMsgNoneLock(peerId)
+				if err != nil {
+					rf.mu.Unlock()
+					return
+				}
+				msg.Req = req
+				rf.mu.Unlock()
+				break
+			}
+		}
+		if !rf.lockWithCheckForLeader(term) {
+			return
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		go func(term int, peerId int, args RequestAppendEntries) {
+			rf.sendAppendRequest(term, peerId, args)
+		}(rf.term, peerId, RequestAppendEntries{})
+		rf.mu.Unlock()
+	}
+}
 func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 	// lazy, but heartBeat can start it
 	rf.mu.Lock()
@@ -739,12 +969,6 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 					// TODO: 要做redirect吗?
 					LeaderId: rf.me,
 				}
-				//req, err := rf.getHeartBeatMsgNoneLock(peerId)
-				//if err != nil {
-				//	rf.mu.Unlock()
-				//	return
-				//}
-				//msg.Req = req
 				rf.mu.Unlock()
 				break
 			}
@@ -962,6 +1186,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 			rf.mu.Unlock()
 			return
 		}
+		DPrintf("[%v][%v] try send vote req to %v\n", rf.me, rf.term, server)
 		rf.mu.Unlock()
 		res = rf.peers[server].Call("Raft.RequestVote", args, &reply)
 	}
@@ -972,7 +1197,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 		return
 	}
 	if reply.Term < rf.term {
-		DPrintf("[%v][%v] vote is out-data, ignore it\n", rf.me, rf.term)
+		DPrintf("[%v][%v] from [%v][%v], vote is out-data, ignore it\n", rf.me, rf.term, server, reply.Term)
 		return
 	}
 	if reply.Term > rf.term {
@@ -980,7 +1205,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 		return
 	}
 	if rf.term != term {
-		DPrintf("[%v][%v] now term %v is not latest, ignore\n", rf.me, rf.term, term)
+		DPrintf("[%v][%v] in this func term %v is not latest, ignore\n", rf.me, rf.term, term)
 		return
 	}
 	if reply.Voted {
