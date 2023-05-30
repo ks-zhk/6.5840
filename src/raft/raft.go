@@ -413,7 +413,7 @@ type ReplyAppendEntries struct {
 func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntries) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("[%v][%v] logs = %v\n", rf.me, rf.term, rf.logs)
+	//defer DPrintf("[%v][%v] logs = %v\n", rf.me, rf.term, rf.logs)
 	if args.Term > rf.term {
 		DPrintf("[%v][%v] get append req, but the term is big\n", rf.me, rf.term)
 		rf.convertToFollowerNoneLock(args.Term)
@@ -873,7 +873,7 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			}
 			if cnt >= (len(rf.peers)+1)/2 && rf.logs[n-1].Term == rf.term {
 				for i := rf.commitIndex + 1; i <= n; i++ {
-					DPrintf("[%v][%v] commit log = %v\n", rf.me, rf.term, rf.logs[i-1])
+					//DPrintf("[%v][%v] commit log = %v\n", rf.me, rf.term, rf.logs[i-1])
 					rf.CallerApplyCh <- ApplyMsg{
 						CommandValid: true,
 						Command:      rf.logs[i-1].Command,
@@ -938,8 +938,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 	}
 	if reply.Voted {
 		if rf.state == Candidate {
+			DPrintf("[%v][%v] now has voted = %v\n", rf.me, rf.term, rf.voteGet)
 			rf.voteGet += 1
-			if rf.voteGet == (len(rf.peers)+1)/2 {
+			if rf.voteGet >= (len(rf.peers)+1)/2 {
 				rf.state = Leader
 				rf.convertToLeaderConfigNoneLock()
 				//go rf.sendHeartBeatAliveJustLoop(rf.term)
@@ -1106,7 +1107,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	DPrintf("[%v][%v] get a command = %v\n", rf.me, rf.term, command)
 	defer rf.mu.Unlock()
-	defer DPrintf("[%v][%v] in start defer logs = %v\n", rf.me, rf.term, rf.logs)
+	//defer DPrintf("[%v][%v] in start defer logs = %v\n", rf.me, rf.term, rf.logs)
 	isLeader = rf.state == Leader
 	if !isLeader || rf.killed() {
 		DPrintf("[%v][%v] is not leader, return false\n", rf.me, rf.term)
@@ -1119,7 +1120,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	rf.persistNoneLock()
-	DPrintf("[%v][%v] in start inside logs = %v\n", rf.me, rf.term, rf.logs)
+	//DPrintf("[%v][%v] in start inside logs = %v\n", rf.me, rf.term, rf.logs)
 	rf.matchIndex[rf.me] = len(rf.logs)
 	//rf.CallerApplyCh <- ApplyMsg{
 	//	CommandValid: true,
