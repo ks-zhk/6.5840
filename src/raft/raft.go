@@ -939,7 +939,17 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *RequestVoteReply, term int) {
 	//fmt.Println("in line 769")
 	var reply RequestVoteReply
-	_ = rf.peers[server].Call("Raft.RequestVote", args, &reply)
+	var res = false
+	for res == false {
+		reply = RequestVoteReply{}
+		rf.mu.Lock()
+		if rf.state != Candidate || rf.term != term || rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+		res = rf.peers[server].Call("Raft.RequestVote", args, &reply)
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.killed() {
