@@ -942,6 +942,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 	_ = rf.peers[server].Call("Raft.RequestVote", args, &reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.killed() {
+		return
+	}
 	if reply.Term < rf.term {
 		return
 	}
@@ -1226,7 +1229,7 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (2A)
 		rf.mu.Lock()
-		//fmt.Printf("%v tick\n", rf.me)
+		DPrintf("[%v][%v] tick, and getMsg = %v\n", rf.me, rf.term, rf.getMsg)
 		if rf.getMsg == false && rf.state != Leader {
 			rf.becomeCandidateNoneLock()
 			rf.sendVoteReqToAllPeerNoneLock(rf.term)
