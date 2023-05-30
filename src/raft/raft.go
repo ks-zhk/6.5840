@@ -426,6 +426,9 @@ func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntr
 	}
 	rf.getMsg = true
 	reply.Term = rf.term
+	if rf.state == Candidate {
+		rf.convertToFollowerNoneLock(rf.term)
+	}
 	if rf.state == Follower {
 		// 特殊情况特殊讨论
 		if args.PrevLogIndex == 0 {
