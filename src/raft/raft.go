@@ -143,7 +143,7 @@ func (rf *Raft) initOfAllServerNoneLock() {
 //	}
 func (rf *Raft) convertToLeaderConfigNoneLock() {
 	DPrintf("[%v][%v] become leader\n", rf.me, rf.term)
-	for i := 0; i < len(rf.nextIndex); i++ {
+	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = len(rf.logs) + 1
 		rf.matchIndex[i] = 0
 		rf.lastHeartBeatOver[i] = true
@@ -943,9 +943,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.killed() {
+		DPrintf("[%v][%v] rf is killed, ignore the vote\n", rf.me, rf.term)
 		return
 	}
 	if reply.Term < rf.term {
+		DPrintf("[%v][%v] vote is out-data, ignore it\n", rf.me, rf.term)
 		return
 	}
 	if reply.Term > rf.term {
@@ -953,6 +955,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 		return
 	}
 	if rf.term != term {
+		DPrintf("[%v][%v] now term %v is not latest, ignore\n", rf.me, rf.term, term)
 		return
 	}
 	if reply.Voted {
