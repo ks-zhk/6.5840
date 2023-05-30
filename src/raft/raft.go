@@ -655,8 +655,12 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 	rf.mu.Lock()
 	ch := rf.applyCh[peerId]
 	rf.mu.Unlock()
-	for msg := range ch {
+	for {
 		// TODO: 在本地生成msg,这样子就可以做到批量发送了
+		msg, ok := <-ch
+		if !ok {
+			return
+		}
 		switch msg.Msg {
 		case Normal:
 			{
@@ -746,13 +750,14 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				break
 			}
 		}
-		if rf.killed() || !rf.isLeaderWithLock() {
-			return
-		}
 		var reply ReplyAppendEntries
 		res := false
 		for res == false {
 			if !rf.lockWithCheckForLeader(term) {
+				return
+			}
+			if rf.killed() {
+				rf.mu.Unlock()
 				return
 			}
 			msg.Req.LeaderCommit = rf.commitIndex
@@ -769,6 +774,10 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 		for reply.Success == false {
 			// decrease
 			if !rf.lockWithCheckForLeader(term) {
+				return
+			}
+			if rf.killed() {
+				rf.mu.Unlock()
 				return
 			}
 			DPrintf("[%v][%v] get reply from [%v] = %v\n", rf.me, rf.term, peerId, reply)
@@ -826,6 +835,10 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 				if !rf.lockWithCheckForLeader(term) {
 					return
 				}
+				if rf.killed() {
+					rf.mu.Unlock()
+					return
+				}
 				msg.Req.LeaderCommit = rf.commitIndex
 				// 更新最新的append msg
 				if rf.nextIndex[peerId] == len(rf.logs)+1 {
@@ -842,6 +855,10 @@ func (rf *Raft) onePeerOneChannel(peerId int, term int) {
 			// fmt.Println("ok")
 		}
 		if !rf.lockWithCheckForLeader(term) {
+			return
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
 			return
 		}
 		if reply.Term > rf.term {
