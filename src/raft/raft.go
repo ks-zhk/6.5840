@@ -89,6 +89,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	snapshot []byte
 }
 
 func (rf *Raft) getNowAppendRequestNoneLock(peerId int) RequestAppendEntries {
@@ -766,11 +767,6 @@ func (rf *Raft) sendAppendRequest(term int, peerId int, args RequestAppendEntrie
 		rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
 	}
 	DPrintf("[%v][%v] receive success append apply from %v, nextIndex = %v, matchIndex = %v\n", rf.me, rf.term, peerId, rf.nextIndex[peerId], rf.matchIndex[peerId])
-	// 找到最低的那个， 二分，线性
-	// 二分答案：有点懒得写。。。
-	// 线性优化：从最高的开始找，尝试找到最大的那个，最高的开始也容易找到与当前term相同的,找到就可以直接break了
-	// 如果n到了commit_index，那就润喽
-	// 这边先写线性
 	for n := len(rf.logs); n > rf.commitIndex; n-- {
 		cnt := 0
 		for _, idx := range rf.matchIndex {
@@ -964,11 +960,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 			if rf.voteGet >= (len(rf.peers)+1)/2 {
 				rf.state = Leader
 				rf.convertToLeaderConfigNoneLock()
-				//go rf.sendHeartBeatAliveJustLoop(rf.term)
-				//go func(term int, me int) {
-				//	rf.heartBeatChan <- term
-				//	DPrintf("[%v][%v] send heart beat msg\n", me, term)
-				//}(rf.term, rf.me)
 			} else {
 				rf.persistNoneLock()
 			}
@@ -1050,7 +1041,6 @@ func (rf *Raft) sendHeartBeatAliveLoop() {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 	}
-	return
 }
 func (rf *Raft) sendHeartBeatLoop(term int) {
 	for rf.killed() == false {
@@ -1078,33 +1068,6 @@ func (rf *Raft) sendHeartBeatLoop(term int) {
 	}
 	return
 }
-
-//	func (rf *Raft) sendHeartBeatLoopNoneLock(term int) {
-//		for rf.killed() == false {
-//			if rf.state != Leader {
-//				return
-//			}
-//			for idx, _ := range rf.peers {
-//				if idx == rf.me {
-//					continue
-//				}
-//				if !rf.lockWithCheckForLeader(term) {
-//					return
-//				}
-//				_, err := rf.getHeartBeatMsgNoneLock(idx)
-//				if err != nil {
-//					rf.mu.Unlock()
-//					return
-//				}
-//				hb := reqWarp{Req: RequestAppendEntries{}, Msg: HeartBeat}
-//				rf.applyCh[idx] <- hb
-//				rf.mu.Unlock()
-//			}
-//			ms := 100 + (rand.Int63() % 10)
-//			time.Sleep(time.Duration(ms) * time.Millisecond)
-//		}
-//		return
-//	}
 func (rf *Raft) requestAppendEntries(command interface{}, peerId int) {
 
 }
@@ -1141,13 +1104,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	rf.persistNoneLock()
-	//DPrintf("[%v][%v] in start inside logs = %v\n", rf.me, rf.term, rf.logs)
 	rf.matchIndex[rf.me] = len(rf.logs)
-	//rf.CallerApplyCh <- ApplyMsg{
-	//	CommandValid: true,
-	//	CommandIndex: len(rf.logs),
-	//	Command:      command,
-	//}
 	index = len(rf.logs)
 	term = rf.term
 	// TODO: start to append log
@@ -1182,19 +1139,6 @@ func (rf *Raft) Kill() {
 		ch <- reqWarp{Req: RequestAppendEntries{}, Msg: Quit}
 		close(ch)
 	}
-	//go func() {
-	//	rf.heartBeatChan <- 1
-	//}()
-	//select {
-	//case rf.heartBeatChan <- -1:
-	//	DPrintf("[%v][%v] quit heartBeat\n", rf.me, rf.term)
-	//default:
-	//	_ = <-rf.heartBeatChan
-	//	rf.heartBeatChan <- -1
-	//	DPrintf("[%v][%v] clean and quit\n", rf.me, rf.term)
-	//}
-	// Your code here, if desired.
-	// graceful shutdown
 }
 
 func (rf *Raft) killed() bool {
@@ -1210,23 +1154,6 @@ const (
 	BecomeFollower ElectionMsg = 3
 )
 
-//	func (rf *Raft) sendAppendEntriesLoop() {
-//		for msg := range rf.sendReqChan {
-//			if msg.Msg == Quit {
-//				return
-//			}
-//			if rf.killed() || !rf.isLeaderWithLock() {
-//				return
-//			}
-//			go func(req RequestAppendEntries) {
-//				for idx, _ := range rf.peers {
-//					if idx == rf.me {
-//						continue
-//					}
-//				}
-//			}(msg.Req)
-//		}
-//	}
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (2A)
