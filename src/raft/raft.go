@@ -95,6 +95,7 @@ type Raft struct {
 	snapshotLastIndex   int
 	snapshotLastTerm    int
 	snapshotLastCommand interface{}
+	snapshotLastOffset  int
 }
 
 func assert(res bool, errMsg string) {
@@ -433,6 +434,70 @@ type ReplyAppendEntries struct {
 	XIndex  int
 	XLen    int
 }
+type RequestInstallSnapshot struct {
+	Term                int
+	LeaderId            int
+	LastIncludedIndex   int
+	LastIncludedTerm    int
+	LastIncludedCommand interface{}
+	Offset              int
+	Data                []byte
+	Done                bool
+}
+type ReplyInstallSnapshot struct {
+	Term  int
+	Valid bool
+}
+
+func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstallSnapshot) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.term {
+		reply.Term = rf.term
+		reply.Valid = false
+		return
+	}
+	if args.Term > rf.term || rf.state == Candidate {
+		rf.convertToFollowerNoneLock(args.Term)
+	}
+	reply.Term = rf.term
+	if args.Offset < rf.snapshotLastOffset {
+		reply.Valid = false
+		return
+	}
+	// 使用 >= 实现幂等性
+	if args.Offset == 0 {
+		// create snapshot file
+		rf.snapshot = []byte{}
+	}
+	rf.snapshot = append(rf.snapshot, args.Data...)
+	rf.snapshotLastOffset = rf.snapshotLastOffset + len(args.Data)
+	if !args.Done {
+		reply.Valid = true
+		return
+	}
+	if rf.convertLocalIndex(args.LastIncludedIndex) > 0 && args.LastIncludedIndex < rf.getLastLogIndex() {
+		entry := rf.getEntryByIndexNoneLock(args.LastIncludedIndex)
+		if entry.Term == args.LastIncludedTerm {
+			rf.logs = rf.logs[rf.convertLocalIndex(args.LastIncludedIndex):]
+		} else {
+			rf.logs = []Entry{}
+		}
+	} else {
+		rf.logs = []Entry{}
+	}
+	rf.snapshotLastIndex = args.LastIncludedIndex
+	rf.snapshotLastTerm = args.LastIncludedTerm
+	rf.snapshotLastCommand = args.LastIncludedCommand
+	rf.CallerApplyCh <- ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      clone(rf.snapshot),
+		SnapshotIndex: rf.snapshotLastIndex,
+		SnapshotTerm:  rf.snapshotLastTerm,
+	}
+	reply.Valid = true
+}
 
 // idx ok
 func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendEntries) {
@@ -718,6 +783,7 @@ func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 	rf.term = newTerm
 	rf.state = Follower
 	rf.hasVoted = false
+	rf.snapshotLastOffset = 0
 	//rf.getMsg = true
 	rf.voteGet = 0
 	rf.persistNoneLock()
@@ -725,6 +791,7 @@ func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 
 // example RequestVote RPC handler.
 // this func is to solve request from peer.
+// idx is ok
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// below is for 2A
@@ -750,7 +817,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 					DPrintf("[%v][%v] deny %v's vote request for last log term is not at least up-to-date\n", rf.me, rf.term, args.CandidateId)
 					return
 				} else if args.LastLogTerm == rf.getLastLogTermNoneLock() {
-					if len(rf.logs) > args.LastLogIndex {
+					if rf.getLastLogIndex() > args.LastLogIndex {
 						reply.Voted = false
 						reply.Term = rf.term
 						DPrintf("[%v][%v] deny %v's vote request for same term but log is not longer\n", rf.me, rf.term, args.CandidateId)
@@ -926,6 +993,76 @@ func (rf *Raft) sendAppendRequest(term int, peerId int, args RequestAppendEntrie
 		}
 	}
 	rf.mu.Unlock()
+}
+func (rf *Raft) sendSnapShotInstallRequest(term int, peerId int) {
+	offset := 0
+	firstChunkSize := 1
+	chunkMaxSize := 1024
+	for {
+		if !rf.lockWithCheckForLeader(term) {
+			return
+		}
+		// locked
+		var size int
+		var done bool
+		var data []byte
+		if offset == 0 {
+			size = firstChunkSize
+		} else {
+			size = chunkMaxSize
+		}
+		if offset+size >= len(rf.snapshot) {
+			done = true
+			data = clone(rf.snapshot[offset:])
+			size = len(rf.snapshot[offset:])
+		} else {
+			done = false
+			data = clone(rf.snapshot[offset : offset+size])
+		}
+		req := RequestInstallSnapshot{
+			Term:              term,
+			LeaderId:          rf.me,
+			LastIncludedIndex: rf.snapshotLastIndex,
+			LastIncludedTerm:  rf.snapshotLastTerm,
+			Offset:            offset,
+			Data:              data,
+			Done:              done,
+		}
+		var res = false
+		var reply ReplyInstallSnapshot
+		rf.mu.Unlock()
+		for res == false {
+			if !rf.lockWithCheckForLeader(term) {
+				return
+			}
+			// locked
+			rf.mu.Unlock()
+			reply = ReplyInstallSnapshot{}
+			res = rf.peers[peerId].Call("Raft.InstallSnapshot", &req, &reply)
+		}
+		if !rf.lockWithCheckForLeader(term) {
+			return
+		}
+		// locked
+		if reply.Term < rf.term {
+			rf.mu.Unlock()
+			return
+		}
+		if reply.Term > rf.term {
+			rf.convertToFollowerNoneLock(reply.Term)
+			rf.mu.Unlock()
+			return
+		}
+		if !reply.Valid {
+			rf.mu.Unlock()
+			return
+		}
+		offset += size
+		rf.mu.Unlock()
+		if done {
+			return
+		}
+	}
 }
 func (rf *Raft) onePeerOneChannelConcurrent(peerId int, term int) {
 	rf.mu.Lock()
