@@ -91,9 +91,16 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	snapshot          []byte
-	snapshotLastIndex int
-	snapshotLastTerm  int
+	snapshot            []byte
+	snapshotLastIndex   int
+	snapshotLastTerm    int
+	snapshotLastCommand interface{}
+}
+
+func assert(res bool, errMsg string) {
+	if !res {
+		panic(errMsg)
+	}
 }
 
 // idx ok
@@ -106,10 +113,23 @@ func (rf *Raft) tryGetEntryByIndexNoneLock(idx int) (Entry, error) {
 
 // idx ok
 func (rf *Raft) getEntryByIndexNoneLock(idx int) Entry {
+	if idx-rf.snapshotLastIndex == 0 {
+		return Entry{
+			Index:   rf.snapshotLastIndex,
+			Term:    rf.snapshotLastTerm,
+			Command: rf.snapshotLastCommand,
+		}
+	}
 	return rf.logs[idx-rf.snapshotLastIndex-1]
 }
 func (rf *Raft) convertLocalIndex(idx int) int {
 	return idx - rf.snapshotLastIndex
+}
+func (rf *Raft) getLastLogIndex() int {
+	if len(rf.logs) == 0 {
+		return rf.snapshotLastIndex
+	}
+	return rf.logs[len(rf.logs)-1].Index
 }
 
 // idx ok
@@ -351,7 +371,6 @@ func (rf *Raft) readPersist(data []byte) {
 	var lastVotedCandidateId int
 	var snapshotLastIndex int
 	var snapshotLastTerm int
-	var snapshot []byte
 	if decoder.Decode(&term) != nil ||
 		decoder.Decode(&voteGet) != nil ||
 		decoder.Decode(&logs) != nil ||
@@ -359,8 +378,7 @@ func (rf *Raft) readPersist(data []byte) {
 		decoder.Decode(&hasVoted) != nil ||
 		decoder.Decode(&lastVotedCandidateId) != nil ||
 		decoder.Decode(&snapshotLastIndex) != nil ||
-		decoder.Decode(&snapshotLastTerm) != nil ||
-		decoder.Decode(&snapshot) != nil {
+		decoder.Decode(&snapshotLastTerm) != nil {
 		panic("decode error")
 	} else {
 		rf.term = term
@@ -416,6 +434,7 @@ type ReplyAppendEntries struct {
 	XLen    int
 }
 
+// idx ok
 func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendEntries) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -435,116 +454,104 @@ func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendE
 	}
 	if rf.state == Follower {
 		// 特殊情况特殊讨论
-		if rf.convertLocalIndex(args.PrevLogIndex) == 0 {
-			// 最特殊的情况, 直接无脑加log即可
-			// fmt.Printf("in it\n")
-			var i int
-			conflict := false
-			for i = args.PrevLogIndex; i < args.PrevLogIndex+len(args.Entries) && i < len(rf.logs); i++ {
-				if rf.logs[rf.convertLocalIndex(i)].Term != args.Entries[i-args.PrevLogIndex].Term {
-					conflict = true
-					break
-				}
-			}
-			// TODO: 直接清空
-			// TODO: 202306012304
-			// 这边其实不应该考虑截断日志。
-			if conflict {
-				rf.logs = rf.logs[:i]
-			}
-			for _, log := range args.Entries[i-args.PrevLogIndex:] {
-				rf.logs = append(rf.logs, log)
-			}
-			rf.persistNoneLock()
-			if args.LeaderCommit > rf.commitIndex {
-				if args.LeaderCommit < len(rf.logs) {
-					for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
-						rf.CallerApplyCh <- ApplyMsg{
-							CommandValid: true,
-							Command:      rf.logs[i-1].Command,
-							CommandIndex: rf.logs[i-1].Index,
-						}
-					}
-					rf.commitIndex = args.LeaderCommit
-				} else {
-					// TODO: 是否要在之前的操作中把那个玩意给干掉。
-					for i := rf.commitIndex + 1; i <= len(rf.logs); i++ {
-						rf.CallerApplyCh <- ApplyMsg{
-							CommandValid: true,
-							Command:      rf.logs[i-1].Command,
-							CommandIndex: rf.logs[i-1].Index,
-						}
-					}
-					rf.commitIndex = len(rf.logs)
-				}
-			}
-			reply.Success = true
-			// fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
-			return
-		}
-		if len(rf.logs) < args.PrevLogIndex {
+		// 1. if not long enough(rf.log[last].Index < args.prevLog)
+		// |-----snapshot-----|-------logs--------|----prevLog-------
+		// 2. long enough, also in logs, wait to match term
+		// |-----snapshot-----|------prevLog--logs|--------------- (include rf.snapshotLastIndex)
+		// 3. long enough, but in snapshot, do not know anything
+		// |-prevLog-snapshot-|-------logs--------|---------------
+		if rf.getLastLogIndex() < args.PrevLogIndex {
+			assert(rf.snapshotLastIndex+len(rf.logs) == rf.getLastLogIndex(), "entry index should same with log's local index")
+			// not long enough
 			reply.Success = false
-			reply.XLen = len(rf.logs)
+			reply.XLen = rf.snapshotLastIndex + len(rf.logs)
 			reply.XTerm = -1
 			reply.XIndex = -1
 			return
 		}
-		if rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-			reply.XTerm = rf.logs[args.PrevLogIndex-1].Term
-			reply.XIndex = args.PrevLogIndex
-			rf.logs = rf.logs[:args.PrevLogIndex-1]
-			reply.Success = false
-			reply.XLen = len(rf.logs)
-			// TODO: 从后往前找而不是从前往后
-			for idx, log := range rf.logs {
-				if log.Term == reply.XTerm {
-					reply.XIndex = idx + 1
-					break
+		if rf.convertLocalIndex(args.PrevLogIndex) > 0 {
+			// long enough, check the
+			entry := rf.getEntryByIndexNoneLock(args.PrevLogIndex)
+			if entry.Term != args.PrevLogTerm {
+				reply.XLen = entry.Term
+				reply.XIndex = -1
+				rf.logs = rf.logs[:rf.convertLocalIndex(args.PrevLogIndex)-1]
+				if rf.snapshotLastTerm != entry.Term {
+					reply.XIndex = args.PrevLogIndex
+					for _, log := range rf.logs {
+						if log.Term == entry.Term {
+							reply.XIndex = log.Index
+							break
+						}
+					}
 				}
+				reply.Success = false
+				reply.XLen = entry.Index - 1
+				return
 			}
-			rf.persistNoneLock()
+		}
+		if rf.convertLocalIndex(args.PrevLogIndex) == 0 {
+			if rf.snapshotLastTerm != args.PrevLogTerm {
+				// snapshot 不同
+				reply.XTerm = rf.snapshotLastTerm
+				reply.Success = false
+				reply.XLen = rf.snapshotLastIndex - 1
+				reply.XIndex = -1 //unknown
+				return
+			}
+		}
+		if rf.convertLocalIndex(args.PrevLogIndex) < 0 {
+			// snapshot未知, 应该进行snapshot覆盖
+			reply.XTerm = -1
+			reply.Success = false
+			reply.XLen = -1
+			reply.XIndex = -1
 			return
 		}
 		var i int
 		conflict := false
 		for i = args.PrevLogIndex; i < args.PrevLogIndex+len(args.Entries) && i < len(rf.logs); i++ {
-			if rf.logs[i].Term != args.Entries[i-args.PrevLogIndex].Term {
+			if rf.logs[rf.convertLocalIndex(i)].Term != args.Entries[i-args.PrevLogIndex].Term {
 				conflict = true
 				break
 			}
 		}
 		if conflict {
-			rf.logs = rf.logs[:i]
+			rf.logs = rf.logs[:rf.convertLocalIndex(i)]
 		}
 		for _, log := range args.Entries[i-args.PrevLogIndex:] {
 			rf.logs = append(rf.logs, log)
-			//rf.CallerApplyCh <- ApplyMsg{
-			//	CommandValid: true,
-			//	CommandIndex: len(rf.logs),
-			//	Command:      log.Command,
-			//}
 		}
 		rf.persistNoneLock()
 		if args.LeaderCommit > rf.commitIndex {
-			if args.LeaderCommit < len(rf.logs) {
+			if args.LeaderCommit < rf.snapshotLastIndex+len(rf.logs) {
 				for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
+					// TODO: should reply with command?
+					if rf.convertLocalIndex(i) < 0 {
+						continue
+					}
 					rf.CallerApplyCh <- ApplyMsg{
 						CommandValid: true,
-						Command:      rf.logs[i-1].Command,
-						CommandIndex: rf.logs[i-1].Index,
+						Command:      rf.getEntryByIndexNoneLock(i).Command,
+						CommandIndex: i,
 					}
 				}
 				rf.commitIndex = args.LeaderCommit
+				//fmt.Println(rf.commitIndex)
 			} else {
-				// TODO: 是否要在之前的操作中把那个玩意给干掉。
-				for i := rf.commitIndex + 1; i <= len(rf.logs); i++ {
+				var i int
+				for i = rf.commitIndex + 1; i <= rf.snapshotLastIndex+len(rf.logs) && i <= args.PrevLogIndex+len(args.Entries); i++ {
+					if rf.convertLocalIndex(i) < 0 {
+						continue
+					}
 					rf.CallerApplyCh <- ApplyMsg{
 						CommandValid: true,
-						Command:      rf.logs[i-1].Command,
-						CommandIndex: rf.logs[i-1].Index,
+						Command:      rf.getEntryByIndexNoneLock(i).Command,
+						CommandIndex: i,
 					}
 				}
-				rf.commitIndex = len(rf.logs)
+				rf.commitIndex = i - 1
+				//fmt.Println(rf.commitIndex)
 			}
 		}
 		reply.Success = true
@@ -559,6 +566,8 @@ func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendE
 	// fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
 	return
 }
+
+// have new AppendEntriesFunc
 func (rf *Raft) AppendEntries(args *RequestAppendEntries, reply *ReplyAppendEntries) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -802,7 +811,7 @@ func (rf *Raft) sendAppendRequest(term int, peerId int, args RequestAppendEntrie
 		prevNextIndex = rf.nextIndex[peerId]
 		rf.mu.Unlock()
 		reply = ReplyAppendEntries{}
-		res = rf.peers[peerId].Call("Raft.AppendEntries", &args, &reply)
+		res = rf.peers[peerId].Call("Raft.AppendEntriesNew", &args, &reply)
 	}
 	for reply.Success == false {
 		// decrease
@@ -870,7 +879,7 @@ func (rf *Raft) sendAppendRequest(term int, peerId int, args RequestAppendEntrie
 			prevNextIndex = rf.nextIndex[peerId]
 			rf.mu.Unlock()
 			reply = ReplyAppendEntries{}
-			res = rf.peers[peerId].Call("Raft.AppendEntries", &args, &reply)
+			res = rf.peers[peerId].Call("Raft.AppendEntriesNew", &args, &reply)
 		}
 	}
 	if !rf.lockWithCheckForLeader(term) {
@@ -902,6 +911,7 @@ func (rf *Raft) sendAppendRequest(term int, peerId int, args RequestAppendEntrie
 				cnt++
 			}
 		}
+		//fmt.Println(n, rf.commitIndex)
 		if cnt >= (len(rf.peers)+1)/2 && rf.logs[n-1].Term == rf.term {
 			for i := rf.commitIndex + 1; i <= n; i++ {
 				//DPrintf("[%v][%v] commit log = %v\n", rf.me, rf.term, rf.logs[i-1])
@@ -1338,6 +1348,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.term = 0
 	rf.dead = 0
 	rf.CallerApplyCh = applyCh
+	rf.snapshotLastTerm = 0
+	rf.snapshotLastIndex = 0
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.snapshot = persister.snapshot
@@ -1346,6 +1358,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	} else if rf.state == Leader {
 		rf.convertToLeaderConfigNoneLock()
 	}
+
 	// start heart beat loop
 	//go rf.sendHeartBeatAliveLoop()
 	// start ticker goroutine to start elections

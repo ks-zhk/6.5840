@@ -21,6 +21,12 @@ import (
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
+func TestMySliceTest2E(t *testing.T) {
+	logs := []Entry{}
+	logs = append(logs, Entry{})
+	logs = logs[:0]
+	fmt.Print(logs)
+}
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
