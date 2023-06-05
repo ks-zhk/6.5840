@@ -95,12 +95,13 @@ type Raft struct {
 	snapshotLastIndexTemp int
 }
 
-func (rf *Raft) solveApplyMsg() {
+func (rf *Raft) solveApplyMsg(me int) {
 	for m := range rf.MineApplyCh {
 		if !m.CommandValid && !m.SnapshotValid {
 			return
 		}
 		rf.CallerApplyCh <- m
+		DPrintf("%v applied %v\n", me, m)
 	}
 }
 
@@ -1447,7 +1448,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//go rf.sendHeartBeatAliveLoop()
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.solveApplyMsg()
+	go rf.solveApplyMsg(rf.me)
 
 	return rf
 }

@@ -240,6 +240,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 
 			cfg.mu.Lock()
 			cfg.lastApplied[i] = m.CommandIndex
+			DPrintf("!?[%v]?! now lastApplied = %v\n", i, cfg.lastApplied[i])
 			cfg.mu.Unlock()
 
 			if (m.CommandIndex+1)%SnapShotInterval == 0 {
@@ -251,6 +252,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 					xlog = append(xlog, cfg.logs[i][j])
 				}
 				e.Encode(xlog)
+				DPrintf("!?[%v]?! make a snapshot with index = %v\n", i, m.CommandIndex)
 				rf.Snapshot(m.CommandIndex, w.Bytes())
 			}
 		} else {
