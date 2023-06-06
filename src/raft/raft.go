@@ -21,8 +21,8 @@ import (
 	"6.5840/labgob"
 	"bytes"
 	"errors"
-	"github.com/sasha-s/go-deadlock"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 	//	"6.5840/labgob"
@@ -59,7 +59,7 @@ const MAX_LOG_NUM = 1999
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        deadlock.Mutex      // Lock to protect shared access to this peer's state, 暂时是一把大锁保平安
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state, 暂时是一把大锁保平安
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -383,6 +383,9 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.voteGet = voteGet
 		rf.state = state
 		rf.hasVoted = hasVoted
+		rf.lastVotedCandidateId = lastVotedCandidateId
+		rf.snapshotLastIndex = snapshotLastIndex
+		rf.snapshotLastTerm = snapshotLastTerm
 	}
 }
 
@@ -398,9 +401,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 	if index <= rf.snapshotLastIndex || index <= rf.snapshotLastIndexTemp {
 		// snapshot is not the latest
-		if rf.commitIndex < index {
-			rf.commitIndex = index
-		}
+		//if rf.commitIndex < index {
+		//	rf.commitIndex = index
+		//}
 		DPrintf("[%v][%v][%v] snapshot is not the latest\n", rf.me, rf.term, rf.snapshotLastIndex)
 		return
 	}
@@ -466,8 +469,9 @@ type RequestInstallSnapshot struct {
 	Done              bool
 }
 type ReplyInstallSnapshot struct {
-	Term  int
-	Valid bool
+	Term              int
+	Valid             bool
+	SnapshotLastIndex int
 }
 
 func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstallSnapshot) {
@@ -476,6 +480,7 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 	if args.Term < rf.term {
 		reply.Term = rf.term
 		reply.Valid = false
+		reply.SnapshotLastIndex = rf.snapshotLastIndex
 		return
 	}
 	if args.Term > rf.term || rf.state == Candidate {
@@ -484,6 +489,7 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 	reply.Term = rf.term
 	if args.Offset < rf.snapshotLastOffset {
 		reply.Valid = false
+		reply.SnapshotLastIndex = rf.snapshotLastIndex
 		return
 	}
 	// reset timeout
@@ -497,6 +503,7 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 	if rf.snapshotLastIndexTemp <= rf.snapshotLastIndex {
 		// 旧的不要了，直接切断吧
 		reply.Valid = false
+		reply.SnapshotLastIndex = rf.snapshotLastIndex
 		return
 	}
 	if len(rf.snapshot) == args.Offset {
@@ -509,11 +516,10 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 	}
 	if !args.Done {
 		reply.Valid = true
+		reply.SnapshotLastIndex = rf.snapshotLastIndex
 		return
 	}
-	if rf.commitIndex < args.LastIncludedIndex {
-		rf.commitIndex = args.LastIncludedIndex
-	}
+	rf.commitIndex = args.LastIncludedIndex
 	if rf.convertLocalIndex(args.LastIncludedIndex) > 0 && args.LastIncludedIndex < rf.getLastLogIndex() {
 		entry := rf.getEntryByIndexNoneLock(args.LastIncludedIndex)
 		if entry.Term == args.LastIncludedTerm {
@@ -538,7 +544,16 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 		SnapshotIndex: rf.snapshotLastIndex,
 		SnapshotTerm:  rf.snapshotLastTerm,
 	}
+	//if rf.commitIndex > rf.snapshotLastIndex {
+	//	// 表示需要回滚
+	//	//nowCommitIndex := rf.commitIndex
+	//	rf.commitIndex = rf.snapshotLastIndex
+	//	//for i := rf.commitIndex + 1; i <= nowCommitIndex && i <= rf.convertLocalIndex(rf.getLastLogIndex()); i++ {
+	//	//	if
+	//	//}
+	//}
 	reply.Valid = true
+	reply.SnapshotLastIndex = rf.snapshotLastIndex
 }
 
 // idx ok
@@ -1078,8 +1093,8 @@ func (rf *Raft) sendAppendRequest(term int, peerId int, argsStatic RequestAppend
 }
 func (rf *Raft) sendSnapShotInstallRequest(term int, peerId int, prevLastNextIndex int) bool {
 	offset := 0
-	firstChunkSize := 4096
-	chunkMaxSize := 4096
+	firstChunkSize := 4096 * 4096 * 1024
+	chunkMaxSize := 4096 * 4096 * 1024
 	for {
 		if !rf.lockWithCheckForLeader(term) {
 			return false
@@ -1089,28 +1104,7 @@ func (rf *Raft) sendSnapShotInstallRequest(term int, peerId int, prevLastNextInd
 		var size int
 		var done bool
 		var data []byte
-		if offset == 0 {
-			size = firstChunkSize
-		} else {
-			size = chunkMaxSize
-		}
-		if offset+size >= len(rf.snapshot) {
-			done = true
-			data = clone(rf.snapshot[offset:])
-			size = len(rf.snapshot[offset:])
-		} else {
-			done = false
-			data = clone(rf.snapshot[offset : offset+size])
-		}
-		req := RequestInstallSnapshot{
-			Term:              term,
-			LeaderId:          rf.me,
-			LastIncludedIndex: rf.snapshotLastIndex,
-			LastIncludedTerm:  rf.snapshotLastTerm,
-			Offset:            offset,
-			Data:              data,
-			Done:              done,
-		}
+		var req RequestInstallSnapshot
 		var res = false
 		var reply ReplyInstallSnapshot
 		rf.mu.Unlock()
@@ -1120,7 +1114,29 @@ func (rf *Raft) sendSnapShotInstallRequest(term int, peerId int, prevLastNextInd
 			}
 			req.LastIncludedIndex = rf.snapshotLastIndex
 			req.LastIncludedTerm = rf.snapshotLastTerm
-
+			// data需要更新
+			if offset == 0 {
+				size = firstChunkSize
+			} else {
+				size = chunkMaxSize
+			}
+			if offset+size >= len(rf.snapshot) {
+				done = true
+				data = clone(rf.snapshot[offset:])
+				size = len(rf.snapshot[offset:])
+			} else {
+				done = false
+				data = clone(rf.snapshot[offset : offset+size])
+			}
+			req = RequestInstallSnapshot{
+				Term:              term,
+				LeaderId:          rf.me,
+				LastIncludedIndex: rf.snapshotLastIndex,
+				LastIncludedTerm:  rf.snapshotLastTerm,
+				Offset:            offset,
+				Data:              data,
+				Done:              done,
+			}
 			// locked
 			rf.mu.Unlock()
 			reply = ReplyInstallSnapshot{}
@@ -1140,8 +1156,16 @@ func (rf *Raft) sendSnapShotInstallRequest(term int, peerId int, prevLastNextInd
 			return false
 		}
 		if !reply.Valid {
+			res := false
+			if reply.SnapshotLastIndex >= rf.snapshotLastIndex {
+				res = true
+				if rf.nextIndex[peerId] == prevLastNextIndex {
+					rf.matchIndex[peerId] = reply.SnapshotLastIndex
+					rf.nextIndex[peerId] = reply.SnapshotLastIndex + 1
+				}
+			}
 			rf.mu.Unlock()
-			return false
+			return res
 		}
 		offset += size
 		if done {
@@ -1278,10 +1302,10 @@ func (rf *Raft) sendHeartBeatAliveJustLoop(term int) {
 			if idx == rf.me {
 				continue
 			}
-			_, err := rf.getHeartBeatMsgNoneLock(idx)
-			if err != nil {
-				panic("state must be leader")
-			}
+			//_, err := rf.getHeartBeatMsgNoneLock(idx)
+			//if err != nil {
+			//	panic("state must be leader")
+			//}
 			var hb reqWarp
 			hb = reqWarp{Req: RequestAppendEntries{}, Msg: HeartBeat}
 			rf.applyCh[idx] <- hb
@@ -1438,7 +1462,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.commitIndex = rf.snapshotLastIndex
-	rf.snapshot = persister.snapshot
+	rf.snapshot = clone(persister.snapshot)
 	if rf.state == Candidate {
 		rf.sendVoteReqToAllPeerNoneLock(rf.term)
 	} else if rf.state == Leader {
