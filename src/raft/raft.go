@@ -879,7 +879,6 @@ func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 	rf.hasVoted = false
 	rf.snapshotLastOffset = 0
 	rf.snapshotLastIndexTemp = -1
-	//rf.getMsg = true
 	rf.voteGet = 0
 	DPrintf("[%v][%v][%v] try to persist in convertToFollowerNoneLock\n", rf.me, rf.term, rf.snapshotLastIndex)
 	rf.persistNoneLock()
@@ -1517,6 +1516,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 		rf.snapshotApplyPendingNum += 1
 	}
+	rf.voteGet = 0
 	if rf.state == Candidate {
 		rf.sendVoteReqToAllPeerNoneLock(rf.term)
 	} else if rf.state == Leader {
