@@ -202,6 +202,7 @@ func (cfg *config) ingestSnap(i int, snapshot []byte, index int) string {
 	for j := 0; j < len(xlog); j++ {
 		cfg.logs[i][j] = xlog[j]
 	}
+	DPrintf("[%v] get a snapshot, and the lastIncludedIndex is %v, update lastApplied\n", i, lastIncludedIndex)
 	cfg.lastApplied[i] = lastIncludedIndex
 	return ""
 }
@@ -210,6 +211,7 @@ const SnapShotInterval = 10
 
 // periodically snapshot raft state
 func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
+	DPrintf("[%v] first start of snapshotApplier!\n", i)
 	cfg.mu.Lock()
 	rf := cfg.rafts[i]
 	cfg.mu.Unlock()
@@ -219,11 +221,13 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 
 	for m := range applyCh {
 		err_msg := ""
+		DPrintf("[%v] get a applyMsg: %v\n", i, m)
 		if m.SnapshotValid {
 			cfg.mu.Lock()
 			err_msg = cfg.ingestSnap(i, m.Snapshot, m.SnapshotIndex)
 			cfg.mu.Unlock()
 		} else if m.CommandValid {
+			DPrintf("[%v] now lastApplied = %v\n", i, cfg.lastApplied[i])
 			if m.CommandIndex != cfg.lastApplied[i]+1 {
 				err_msg = fmt.Sprintf("server %v apply out of order, expected index %v, got %v", i, cfg.lastApplied[i]+1, m.CommandIndex)
 			}
