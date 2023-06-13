@@ -988,8 +988,10 @@ func internalChurn(t *testing.T, unreliable bool) {
 				rf := cfg.rafts[i]
 				cfg.mu.Unlock()
 				if rf != nil {
+					DPrintf("in test, in goroutine , try start %v, send to server = %v\n", x, i)
 					index1, _, ok1 := rf.Start(x)
 					if ok1 {
+						DPrintf("in test, success start %v\n", x)
 						ok = ok1
 						index = index1
 					}
@@ -999,7 +1001,9 @@ func internalChurn(t *testing.T, unreliable bool) {
 				// maybe leader will commit our value, maybe not.
 				// but don't wait forever.
 				for _, to := range []int{10, 20, 50, 100, 200} {
+					DPrintf("in test to get nCommitted\n")
 					nd, cmd := cfg.nCommitted(index)
+					DPrintf("in test to get nCommitted = %v\n", nd)
 					if nd > 0 {
 						if xx, ok := cmd.(int); ok {
 							if xx == x {
@@ -1023,9 +1027,10 @@ func internalChurn(t *testing.T, unreliable bool) {
 	cha := []chan []int{}
 	for i := 0; i < ncli; i++ {
 		cha = append(cha, make(chan []int))
+		DPrintf("go a goroutine\n")
 		go cfn(i, cha[i])
 	}
-
+	DPrintf("in test, begin disconnect and crash\n")
 	for iters := 0; iters < 20; iters++ {
 		if (rand.Int() % 1000) < 200 {
 			i := rand.Int() % servers
@@ -1056,17 +1061,19 @@ func internalChurn(t *testing.T, unreliable bool) {
 
 	time.Sleep(RaftElectionTimeout)
 	cfg.setunreliable(false)
+	DPrintf("in test, begin start crash and connect\n")
 	for i := 0; i < servers; i++ {
 		if cfg.rafts[i] == nil {
 			cfg.start1(i, cfg.applier)
 		}
 		cfg.connect(i)
 	}
-
+	DPrintf("in test, make Stop signal\n")
 	atomic.StoreInt32(&stop, 1)
 
 	values := []int{}
 	for i := 0; i < ncli; i++ {
+		DPrintf("in test, wait for client %v to quit\n", i)
 		vv := <-cha[i]
 		if vv == nil {
 			t.Fatal("client failed")
@@ -1075,12 +1082,16 @@ func internalChurn(t *testing.T, unreliable bool) {
 	}
 
 	time.Sleep(RaftElectionTimeout)
-
-	lastIndex := cfg.one(rand.Int(), servers, true)
+	toPut := rand.Int()
+	DPrintf("in debug to put %v\n", toPut)
+	lastIndex := cfg.one(toPut, servers, true)
+	DPrintf("in debug to put success %v\n", toPut)
 
 	really := make([]int, lastIndex+1)
 	for index := 1; index <= lastIndex; index++ {
+		DPrintf("in test, wait for v\n")
 		v := cfg.wait(index, servers, -1)
+		DPrintf("in test, get v = %v\n", v)
 		if vi, ok := v.(int); ok {
 			really = append(really, vi)
 		} else {

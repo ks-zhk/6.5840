@@ -73,7 +73,7 @@ type Raft struct {
 	lastVotedCandidateId int
 	getMsg               bool
 	lastHeartBeatOver    []bool
-	applyCh              []chan reqWarp
+	//applyCh              []chan reqWarp
 	// below if (2B)
 	logs                    []Entry
 	commitIndex             int
@@ -238,8 +238,8 @@ func (rf *Raft) convertToLeaderConfigNoneLock() {
 		}
 		rf.matchIndex[i] = 0
 		rf.lastHeartBeatOver[i] = true
-		rf.applyCh[i] = make(chan reqWarp, 100)
-		go rf.onePeerOneChannelConcurrent(i, rf.term)
+		//rf.applyCh[i] = make(chan reqWarp, 100)
+		//go rf.onePeerOneChannelConcurrent(i, rf.term, rf.applyCh[i])
 	}
 	go rf.sendHeartBeatAliveJustLoop(rf.term)
 	DPrintf("[%v][%v][%v] try to persist in convertToLeaderConfigNoneLock\n", rf.me, rf.term, rf.snapshotLastIndex)
@@ -1224,10 +1224,10 @@ func (rf *Raft) sendSnapShotInstallRequest(term int, peerId int, prevLastNextInd
 		rf.mu.Unlock()
 	}
 }
-func (rf *Raft) onePeerOneChannelConcurrent(peerId int, term int) {
-	rf.mu.Lock()
-	ch := rf.applyCh[peerId]
-	rf.mu.Unlock()
+func (rf *Raft) onePeerOneChannelConcurrent(peerId int, term int, ch chan reqWarp) {
+	//rf.mu.Lock()
+	//ch := rf.applyCh[peerId]
+	//rf.mu.Unlock()
 	for {
 		msg, ok := <-ch
 		if !ok {
@@ -1317,7 +1317,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *Reque
 	}
 	if reply.Voted {
 		if rf.state == Candidate {
-			DPrintf("[%v][%v][%v] get vote from %v, now has voted = %v\n", rf.me, rf.term, rf.snapshotLastIndex, server, rf.voteGet)
+			DPrintf("[%v][%v][%v] get vote from %v, now has voted = %v, total peer num = %v\n", rf.me, rf.term, rf.snapshotLastIndex, server, rf.voteGet, len(rf.peers))
 			rf.voteGet += 1
 			if rf.voteGet >= (len(rf.peers)+1)/2 {
 				rf.state = Leader
@@ -1354,9 +1354,9 @@ func (rf *Raft) sendHeartBeatAliveJustLoop(term int) {
 			//if err != nil {
 			//	panic("state must be leader")
 			//}
-			var hb reqWarp
-			hb = reqWarp{Req: RequestAppendEntries{}, Msg: HeartBeat}
-			rf.applyCh[idx] <- hb
+			go func(term int, peerId int, args RequestAppendEntries) {
+				rf.sendAppendRequest(term, peerId, args)
+			}(rf.term, idx, RequestAppendEntries{})
 		}
 		rf.mu.Unlock()
 		ms := 150 + (rand.Int63() % 20)
@@ -1408,7 +1408,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			continue
 		}
 		if nextIdx <= rf.snapshotLastIndex+len(rf.logs) {
-			rf.applyCh[idx] <- reqWarp{Req: RequestAppendEntries{}, Msg: Normal}
+			//DPrintf("[%v][%v][%v] try to send into applyCh of command = %v\n", rf.me, rf.term, rf.snapshotLastIndex, command)
+			//rf.applyCh[idx] <- reqWarp{Req: RequestAppendEntries{}, Msg: Normal}
+			//DPrintf("[%v][%v][%v] success send into applyCh of command = %v\n", rf.me, rf.term, rf.snapshotLastIndex, command)
+			if rf.convertLocalIndex(rf.nextIndex[idx]) < len(rf.logs)+1 {
+				go func(term int, peerId int, args RequestAppendEntries) {
+					rf.sendAppendRequest(term, peerId, args)
+				}(rf.term, idx, RequestAppendEntries{})
+			}
 		}
 	}
 	return index, term, isLeader
@@ -1428,10 +1435,10 @@ func (rf *Raft) Kill() {
 	// close req send loop
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	for _, ch := range rf.applyCh {
-		ch <- reqWarp{Req: RequestAppendEntries{}, Msg: Quit}
-		close(ch)
-	}
+	//for _, ch := range rf.applyCh {
+	//	ch <- reqWarp{Req: RequestAppendEntries{}, Msg: Quit}
+	//	close(ch)
+	//}
 	rf.MineApplyCh <- ApplyMsg{CommandValid: false, SnapshotValid: false}
 }
 
@@ -1487,7 +1494,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.nextIndex = []int{}
 	rf.matchIndex = []int{}
-	rf.applyCh = []chan reqWarp{}
+	//rf.applyCh = []chan reqWarp{}
 	// 为1的ch
 	rf.heartBeatChan = make(chan int)
 	rf.MineApplyCh = make(chan ApplyMsg, 10000)
@@ -1495,7 +1502,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex = append(rf.nextIndex, 1)
 		rf.matchIndex = append(rf.matchIndex, 0)
 		rf.lastHeartBeatOver = append(rf.lastHeartBeatOver, true)
-		rf.applyCh = append(rf.applyCh, make(chan reqWarp, 10000))
+		//rf.applyCh = append(rf.applyCh, make(chan reqWarp, 10000))
 	}
 	rf.commitIndex = 0
 	rf.state = Follower
@@ -1533,11 +1540,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.snapshotApplyPendingNum += 1
 	}
 	rf.voteGet = 0
-	if rf.state == Candidate {
-		rf.sendVoteReqToAllPeerNoneLock(rf.term)
-	} else if rf.state == Leader {
-		rf.convertToLeaderConfigNoneLock()
-	}
+	rf.state = Follower
+	//if rf.state == Candidate {
+	//	rf.sendVoteReqToAllPeerNoneLock(rf.term)
+	//} else if rf.state == Leader {
+	//	rf.convertToLeaderConfigNoneLock()
+	//}
 	//if len(rf.snapshot) == 0 && rf.snapshotLastIndex > 0 {
 	//	rf.snapshotLastIndex = 0
 	//	rf.snapshotLastTerm = 0
