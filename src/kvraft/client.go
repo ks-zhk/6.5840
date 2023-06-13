@@ -1,14 +1,23 @@
 package kvraft
 
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 
-
+// client本身并不会产生并发，并发的是多个client并发。
+// 因此client这里不需要处理并法逻辑，server那边需要处理并发逻辑
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	// leader缓存，减少rpc的调用。
+	nowLeader int
 }
+
+var nextIndex int = 0
+var nmu sync.Mutex = sync.Mutex{}
 
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
@@ -20,6 +29,7 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.nowLeader = 0 //假设0成为了leader
 	// You'll have to add code here.
 	return ck
 }

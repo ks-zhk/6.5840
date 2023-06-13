@@ -22,11 +22,11 @@ import (
 	"bytes"
 	"errors"
 	"math/rand"
-	"sync"
 	"sync/atomic"
 	"time"
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
+	"github.com/sasha-s/go-deadlock"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -42,7 +42,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-
+	CommandTerm  int
 	// For 2D:
 	SnapshotValid bool
 	Snapshot      []byte
@@ -59,7 +59,7 @@ const MAX_LOG_NUM = 1999
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state, 暂时是一把大锁保平安
+	mu        deadlock.Mutex      // Lock to protect shared access to this peer's state, 暂时是一把大锁保平安
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -414,6 +414,8 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	DPrintf("[%v] in Snapshot\n", rf.me)
+	defer DPrintf("[%v] quit Snapshot\n", rf.me)
 	// Your code here (2D).
 	// TODO: realize snapshot
 	// DPrintf("[%v] try to lock in snapshot\n", rf.me)
@@ -502,6 +504,8 @@ type ReplyInstallSnapshot struct {
 }
 
 func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstallSnapshot) {
+	DPrintf("[%v] in InstallSnapshot\n", rf.me)
+	defer DPrintf("[%v] quit InstallSnapshot\n", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term < rf.term {
@@ -584,6 +588,8 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 
 // idx ok
 func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendEntries) {
+	DPrintf("[%v] in AppendEntriesNew\n", rf.me)
+	defer DPrintf("[%v] quit AppendEntriesNew\n", rf.me)
 	// DPrintf("[%v] try to lock in AppendEntriesNew\n", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -692,6 +698,7 @@ func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendE
 						CommandValid: true,
 						Command:      rf.getEntryByIndexNoneLock(i).Command,
 						CommandIndex: i,
+						CommandTerm:  rf.getEntryByIndexNoneLock(i).Term,
 					}
 				}
 				rf.commitIndex = args.LeaderCommit
@@ -707,6 +714,7 @@ func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendE
 						CommandValid: true,
 						Command:      rf.getEntryByIndexNoneLock(i).Command,
 						CommandIndex: i,
+						CommandTerm:  rf.getEntryByIndexNoneLock(i).Term,
 					}
 				}
 				rf.commitIndex = i - 1
@@ -879,6 +887,7 @@ func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 	rf.hasVoted = false
 	rf.snapshotLastOffset = 0
 	rf.snapshotLastIndexTemp = -1
+	//rf.getMsg = true
 	rf.voteGet = 0
 	DPrintf("[%v][%v][%v] try to persist in convertToFollowerNoneLock\n", rf.me, rf.term, rf.snapshotLastIndex)
 	rf.persistNoneLock()
@@ -888,6 +897,8 @@ func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 // this func is to solve request from peer.
 // idx is ok
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	DPrintf("[%v] in RequestVote\n", rf.me)
+	defer DPrintf("[%v] quit RequestVote\n", rf.me)
 	// Your code here (2A, 2B).
 	// below is for 2A
 	// DPrintf("[%v] try to lock in RequestVote\n", rf.me)
@@ -959,6 +970,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	return
 }
 func (rf *Raft) sendAppendRequest(term int, peerId int, argsStatic RequestAppendEntries) {
+	//DPrintf("[%v] in sendAppendRequest\n", rf.me)
+	//defer DPrintf("[%v] quit sendAppendRequest\n", rf.me)
 	var reply ReplyAppendEntries
 	var prevNextIndex int
 	res := false
@@ -1110,6 +1123,7 @@ func (rf *Raft) sendAppendRequest(term int, peerId int, argsStatic RequestAppend
 						CommandValid: true,
 						Command:      rf.logs[rf.convertLocalIndex(i)-1].Command,
 						CommandIndex: i,
+						CommandTerm:  rf.logs[rf.convertLocalIndex(i)-1].Term,
 					}
 				}
 				if rf.commitIndex < n {
@@ -1266,6 +1280,8 @@ func (rf *Raft) onePeerOneChannelConcurrent(peerId int, term int) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, _reply *RequestVoteReply, term int) {
 	//fmt.Println("in line 769")
+	DPrintf("[%v] in sendRequestVote\n", rf.me)
+	defer DPrintf("[%v] quit sendRequestVote\n", rf.me)
 	var reply RequestVoteReply
 	var res = false
 	for res == false {
@@ -1343,7 +1359,7 @@ func (rf *Raft) sendHeartBeatAliveJustLoop(term int) {
 			rf.applyCh[idx] <- hb
 		}
 		rf.mu.Unlock()
-		ms := 100
+		ms := 150 + (rand.Int63() % 20)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -1445,7 +1461,7 @@ func (rf *Raft) ticker() {
 			rf.getMsg = false
 		}
 		rf.mu.Unlock()
-		ms := 200 + (rand.Int63() % 250)
+		ms := 350 + (rand.Int63() % 250)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }

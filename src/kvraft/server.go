@@ -17,14 +17,40 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
-
+func (kv *KVServer) MyDebugNoneLock(format string, a ...interface{}) {
+	DPrintf("KVServer id = %v", kv.me)
+	DPrintf(format, a...)
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type OpType
+	Key  string
+	Args string
 }
+type OpType int
 
+const (
+	AppendOp OpType = 0
+	PutOp    OpType = 1
+)
+
+type OpRes int
+
+const (
+	OpResOk   OpRes = 0
+	OpResFail OpRes = 1
+	OpUnknown OpRes = 2
+)
+
+type OpChan struct {
+	expectTerm int
+	op         Op
+	cond       *sync.Cond
+	opRes      OpRes
+}
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -35,15 +61,76 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	stateMachine map[string]string
+	pendingOps   map[int]*OpChan // key = index
+	dupTable     map[int]*OpChan // key = id
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	op := Op{}
+	res, ok := kv.dupTable[args.Rid]
+	if ok == false {
+		if args.Op == "Put" {
+			op.Type = PutOp
+		} else if args.Op == "Append" {
+			op.Type = AppendOp
+		} else {
+			reply.Err = ErrNoSupportOp
+			kv.mu.Unlock()
+			return
+		}
+		op.Key = args.Key
+		op.Args = args.Value
+		index, term, isLeader := kv.rf.Start(op)
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+			kv.mu.Unlock()
+			return
+		}
+		opChan := OpChan{
+			cond:       sync.NewCond(&sync.Mutex{}),
+			expectTerm: term,
+			op:         op,
+		}
+		kv.pendingOps[index] = &opChan
+		kv.dupTable[args.Rid] = &opChan
+		// 如果长时间没有commit，那就直接没了。
+		// 最好的方案还是修改raft，然后搞一个失败chan
+		kv.mu.Unlock()
+		opChan.cond.L.Lock()
+		for opChan.opRes == OpUnknown {
+			opChan.cond.Wait()
+		}
+		if opChan.opRes == OpResFail {
+			reply.Err = ErrCommitFailed
+		} else {
+			reply.Err = OK
+		}
+		opChan.cond.L.Unlock()
+	} else {
+		res.cond.L.Lock()
+		for res.opRes == OpUnknown {
+			res.cond.Wait()
+		}
+		if res.opRes == OpResFail {
+			reply.Err = ErrCommitFailed
+		} else {
+			reply.Err = OK
+		}
+		res.cond.L.Unlock()
+	}
+}
+func (kv *KVServer) Ack(args *AckArgs, reply *AckReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 }
 
 // the tester calls Kill() when a KVServer instance won't

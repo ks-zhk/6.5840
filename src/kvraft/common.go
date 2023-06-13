@@ -1,9 +1,11 @@
 package kvraft
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK              = "OK"
+	ErrNoKey        = "ErrNoKey"
+	ErrWrongLeader  = "ErrWrongLeader"
+	ErrNoSupportOp  = "ErrNoSupportOp"
+	ErrCommitFailed = "ErrCommitFailed"
 )
 
 type Err string
@@ -16,10 +18,13 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Rid int
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err      Err
+	Term     int
+	LogIndex int
 }
 
 type GetArgs struct {
@@ -30,4 +35,9 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+type AckArgs struct {
+	Rid int
+}
+type AckReply struct {
 }
