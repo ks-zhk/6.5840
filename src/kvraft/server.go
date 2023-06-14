@@ -61,22 +61,82 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	stateMachine map[string]string
-	pendingOps   map[int]*OpChan // key = index
-	dupTable     map[int]*OpChan // key = id
+	stateMachine      map[string]string
+	pendingOps        map[int]*OpChan // key = index
+	dupTable          map[int]*OpChan // key = id
+	indexId           map[int]int     // key = index, value = id
+	idIndex           map[int]int     // key = id, value = index
+	maxCommitIndex    int
+	snapshot          []byte
+	snapshotLastIndex int
 }
 
+func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
+	for msg := range ch {
+		if !msg.SnapshotValid && !msg.CommandValid {
+			return
+		}
+		kv.MyDebugNoneLock("get a commit %v\n", msg)
+		if msg.CommandValid {
+			kv.mu.Lock()
+			index := msg.CommandIndex
+			term := msg.CommandTerm
+			if opc, ok := kv.pendingOps[index]; ok && msg.CommandIndex > kv.maxCommitIndex {
+				kv.MyDebugNoneLock("hit the pending index = %v\n", index)
+				opc.cond.L.Lock()
+				if opc.opRes == OpUnknown {
+					if opc.expectTerm == term {
+						opc.opRes = OpResOk
+					} else {
+						opc.opRes = OpResFail
+					}
+					opc.cond.Broadcast()
+				}
+				opc.cond.L.Unlock()
+			}
+			if op, ok := msg.Command.(Op); ok && msg.CommandIndex > kv.maxCommitIndex {
+				if op.Type == AppendOp {
+					if m, ok := kv.stateMachine[op.Key]; ok {
+						m += op.Args
+						kv.stateMachine[op.Key] = m
+					} else {
+						kv.stateMachine[op.Key] = op.Args
+					}
+				}
+				if op.Type == PutOp {
+					kv.stateMachine[op.Key] = op.Args
+				}
+				kv.maxCommitIndex = msg.CommandIndex
+			}
+			kv.mu.Unlock()
+		} else {
+			// TODO: 等待实现snapshot的形式
+		}
+	}
+}
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-
+	// TODO: 思考，是否需要进行leader判断。还是进行majority获取
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if m, ok := kv.stateMachine[args.Key]; ok {
+		reply.Err = OK
+		reply.Value = m
+	} else {
+		reply.Err = ErrNoKey
+		reply.Value = ""
+	}
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	op := Op{}
+	kv.MyDebugNoneLock("get a PutAppend req = %v\n", args)
 	res, ok := kv.dupTable[args.Rid]
 	if ok == false {
+
 		if args.Op == "Put" {
 			op.Type = PutOp
 		} else if args.Op == "Append" {
@@ -89,11 +149,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		op.Key = args.Key
 		op.Args = args.Value
 		index, term, isLeader := kv.rf.Start(op)
+
 		if !isLeader {
+			kv.MyDebugNoneLock("this req is fresh new, however this server is not leader, just return reply\n")
 			reply.Err = ErrWrongLeader
 			kv.mu.Unlock()
 			return
 		}
+		kv.MyDebugNoneLock("this req is fresh new, and this server is a leader, try to start\n")
 		opChan := OpChan{
 			cond:       sync.NewCond(&sync.Mutex{}),
 			expectTerm: term,
@@ -101,6 +164,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 		kv.pendingOps[index] = &opChan
 		kv.dupTable[args.Rid] = &opChan
+		kv.indexId[index] = args.Rid
+		kv.idIndex[args.Rid] = index
 		// 如果长时间没有commit，那就直接没了。
 		// 最好的方案还是修改raft，然后搞一个失败chan
 		kv.mu.Unlock()
@@ -145,6 +210,11 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.applyCh <- raft.ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: false,
+	}
+
 }
 
 func (kv *KVServer) killed() bool {
@@ -170,6 +240,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
@@ -177,7 +249,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.idIndex = make(map[int]int)
+	kv.indexId = make(map[int]int)
+	kv.dupTable = make(map[int]*OpChan)
+	kv.pendingOps = make(map[int]*OpChan)
+	kv.snapshotLastIndex = 0
+	kv.maxCommitIndex = kv.snapshotLastIndex
+	kv.stateMachine = make(map[string]string)
+	kv.dead = 0
 	// You may need initialization code here.
 
 	return kv

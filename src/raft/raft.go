@@ -22,11 +22,11 @@ import (
 	"bytes"
 	"errors"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
-	"github.com/sasha-s/go-deadlock"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -59,7 +59,7 @@ const MAX_LOG_NUM = 1999
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        deadlock.Mutex      // Lock to protect shared access to this peer's state, 暂时是一把大锁保平安
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state, 暂时是一把大锁保平安
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -241,6 +241,9 @@ func (rf *Raft) convertToLeaderConfigNoneLock() {
 		//rf.applyCh[i] = make(chan reqWarp, 100)
 		//go rf.onePeerOneChannelConcurrent(i, rf.term, rf.applyCh[i])
 	}
+	rf.lastVotedCandidateId = -1
+	rf.hasVoted = false
+	rf.voteGet = 0
 	go rf.sendHeartBeatAliveJustLoop(rf.term)
 	DPrintf("[%v][%v][%v] try to persist in convertToLeaderConfigNoneLock\n", rf.me, rf.term, rf.snapshotLastIndex)
 	rf.persistNoneLock()
@@ -324,6 +327,7 @@ func (rf *Raft) becomeCandidateNoneLock() {
 	rf.state = Candidate
 	rf.getMsg = true
 	rf.hasVoted = true
+	rf.lastVotedCandidateId = rf.me
 	rf.voteGet = 1
 	DPrintf("[%v][%v][%v] try to persist in becomeCandidateNoneLock\n", rf.me, rf.term, rf.snapshotLastIndex)
 	rf.persistNoneLock()
@@ -585,6 +589,20 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 	reply.Valid = true
 	reply.SnapshotLastIndex = rf.snapshotLastIndex
 }
+func MineMax(x int, y int) int {
+	if x > y {
+		return x
+	} else {
+		return y
+	}
+}
+func MineMin(x int, y int) int {
+	if x < y {
+		return x
+	} else {
+		return y
+	}
+}
 
 // idx ok
 func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendEntries) {
@@ -688,37 +706,41 @@ func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendE
 		rf.persistNoneLock()
 		if args.LeaderCommit > rf.commitIndex && rf.snapshotApplyPendingNum == 0 {
 			if args.LeaderCommit < rf.snapshotLastIndex+len(rf.logs) {
-				for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
-					// TODO: should reply with command?
-					if rf.convertLocalIndex(i) < 1 {
-						continue
+				if rf.getEntryByIndexNoneLock(i).Term == rf.term {
+					for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
+						// TODO: should reply with command?
+						if rf.convertLocalIndex(i) < 1 {
+							continue
+						}
+						DPrintf("[%v][%v][%v] apply index = %v\n", rf.me, rf.term, rf.snapshotLastIndex, i)
+						rf.MineApplyCh <- ApplyMsg{
+							CommandValid: true,
+							Command:      rf.getEntryByIndexNoneLock(i).Command,
+							CommandIndex: i,
+							CommandTerm:  rf.getEntryByIndexNoneLock(i).Term,
+						}
 					}
-					DPrintf("[%v][%v][%v] apply index = %v\n", rf.me, rf.term, rf.snapshotLastIndex, i)
-					rf.MineApplyCh <- ApplyMsg{
-						CommandValid: true,
-						Command:      rf.getEntryByIndexNoneLock(i).Command,
-						CommandIndex: i,
-						CommandTerm:  rf.getEntryByIndexNoneLock(i).Term,
-					}
+					rf.commitIndex = args.LeaderCommit
 				}
-				rf.commitIndex = args.LeaderCommit
 				//fmt.Println(rf.commitIndex)
 			} else {
 				var i int
-				for i = rf.commitIndex + 1; i <= rf.snapshotLastIndex+len(rf.logs) && i <= args.PrevLogIndex+len(args.Entries); i++ {
-					if rf.convertLocalIndex(i) < 1 {
-						continue
+				r := MineMin(rf.snapshotLastIndex+len(rf.logs), args.PrevLogIndex+len(args.Entries))
+				if rf.getEntryByIndexNoneLock(r).Term == rf.term {
+					for i = rf.commitIndex + 1; i <= r; i++ {
+						if rf.convertLocalIndex(i) < 1 {
+							continue
+						}
+						DPrintf("[%v][%v][%v] apply index = %v\n", rf.me, rf.term, rf.snapshotLastIndex, i)
+						rf.MineApplyCh <- ApplyMsg{
+							CommandValid: true,
+							Command:      rf.getEntryByIndexNoneLock(i).Command,
+							CommandIndex: i,
+							CommandTerm:  rf.getEntryByIndexNoneLock(i).Term,
+						}
 					}
-					DPrintf("[%v][%v][%v] apply index = %v\n", rf.me, rf.term, rf.snapshotLastIndex, i)
-					rf.MineApplyCh <- ApplyMsg{
-						CommandValid: true,
-						Command:      rf.getEntryByIndexNoneLock(i).Command,
-						CommandIndex: i,
-						CommandTerm:  rf.getEntryByIndexNoneLock(i).Term,
-					}
+					rf.commitIndex = i - 1
 				}
-				rf.commitIndex = i - 1
-				//fmt.Println(rf.commitIndex)
 			}
 		}
 		reply.Success = true
@@ -887,6 +909,7 @@ func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 	rf.hasVoted = false
 	rf.snapshotLastOffset = 0
 	rf.snapshotLastIndexTemp = -1
+	rf.lastVotedCandidateId = -1
 	//rf.getMsg = true
 	rf.voteGet = 0
 	DPrintf("[%v][%v][%v] try to persist in convertToFollowerNoneLock\n", rf.me, rf.term, rf.snapshotLastIndex)
@@ -1539,8 +1562,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 		rf.snapshotApplyPendingNum += 1
 	}
-	rf.voteGet = 0
 	rf.state = Follower
+	rf.voteGet = 0
+	//
+	//rf.convertToFollowerNoneLock(rf.term)
+	//rf.voteGet = 0
+	//rf.state = Follower
 	//if rf.state == Candidate {
 	//	rf.sendVoteReqToAllPeerNoneLock(rf.term)
 	//} else if rf.state == Leader {
