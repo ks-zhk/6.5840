@@ -551,12 +551,21 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 		SnapshotTerm:  args.LastIncludedTerm,
 	}
 	rf.persistNoneLock()
+	lastAppliedTemp := rf.lastApplied
 	rf.snapshotApplyPendingNum += 1
-	go func(m ApplyMsg) {
-		rf.snapshotApplier <- m
-	}(applyMsg)
+	rf.mu.Unlock()
+	rf.snapshotApplier <- applyMsg
+	rf.mu.Lock()
+	rf.snapshotApplyPendingNum -= 1
+	if rf.lastApplied == lastAppliedTemp {
+		rf.lastApplied = applyMsg.SnapshotIndex
+		rf.snapshotLastIndex = applyMsg.SnapshotIndex
+		rf.snapshotLastTerm = applyMsg.SnapshotTerm
+		// TODO:todo
+		reply.SnapshotLastIndex = rf.snapshotLastIndex
+	}
 	reply.Valid = true
-	reply.SnapshotLastIndex = rf.snapshotLastIndex
+
 }
 func MineMax(x int, y int) int {
 	if x > y {
