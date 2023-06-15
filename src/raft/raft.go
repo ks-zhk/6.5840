@@ -1254,7 +1254,6 @@ func (rf *Raft) applier(initSnapshotLastIndex int) {
 				CommandTerm:  rf.getEntryByIndexNoneLock(rf.lastApplied + 1).Term}
 			rf.lastApplied += 1
 			rf.mu.Unlock()
-			// 这里不能确定snapshotPending == 0
 			rf.CallerApplyCh <- msg
 			rf.mu.Lock()
 		} else {
