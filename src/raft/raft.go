@@ -49,6 +49,10 @@ type ApplyMsg struct {
 	SnapshotTerm  int
 	SnapshotIndex int
 }
+type ApplyMsgWarp struct {
+	Msg        ApplyMsg
+	NotifyChan chan bool
+}
 type Entry struct {
 	Term    int
 	Index   int
@@ -76,26 +80,24 @@ type Raft struct {
 	applyCond            *sync.Cond
 	//applyCh              []chan reqWarp
 	// below if (2B)
-	logs                    []Entry
-	commitIndex             int
-	snapshotApplyPendingNum int
-	lastApplied             int
+	logs        []Entry
+	commitIndex int
+	lastApplied int
 
-	nextIndex       []int
-	matchIndex      []int
-	CallerApplyCh   chan ApplyMsg
-	snapshotApplier chan ApplyMsg
-	//MineApplyCh     chan ApplyMsg
+	nextIndex     []int
+	matchIndex    []int
+	CallerApplyCh chan ApplyMsg
 	heartBeatChan chan int
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	snapshot              []byte
-	snapshotLastIndex     int
-	snapshotLastTerm      int
-	snapshotLastOffset    int
-	snapshotLastIndexTemp int
+	snapshot                 []byte
+	snapshotLastIndex        int
+	snapshotLastTerm         int
+	snapshotLastOffset       int
+	snapshotLastIndexTemp    int
+	lastAppliedSnapshotIndex int
 }
 
 //	func (rf *Raft) solveApplyMsg(me int) {
@@ -432,6 +434,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		DPrintf("[%v][%v][%v] snapshot is too big, can not fit\n", rf.me, rf.term, rf.snapshotLastIndex)
 		return
 	}
+	//applyMsg := ApplyMsgWarp{
+	//	Msg: ApplyMsg{
+	//		CommandValid:  false,
+	//		SnapshotValid: true,
+	//		Snapshot:      clone(snapshot),
+	//		SnapshotIndex: index,
+	//		SnapshotTerm:  rf.getEntryByIndexNoneLock(index).Term,
+	//	},
+	//
+	//}
 	rf.snapshot = snapshot
 	lastEntry := rf.getEntryByIndexNoneLock(index)
 	// 准备commit
@@ -439,7 +451,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshotLastIndex = index
 	rf.snapshotLastTerm = lastEntry.Term
 	DPrintf("[%v][%v][%v] try to persist in Snapshot\n", rf.me, rf.term, rf.snapshotLastIndex)
-	rf.lastApplied = index
+	//rf.lastApplied = index
+	rf.applyCond.Signal()
 	rf.persistNoneLock()
 	return
 }
@@ -523,49 +536,32 @@ func (rf *Raft) InstallSnapshot(args *RequestInstallSnapshot, reply *ReplyInstal
 		reply.SnapshotLastIndex = rf.snapshotLastIndex
 		return
 	}
-	if args.Offset == 0 {
-		// create snapshot file
-		rf.snapshot = []byte{}
-	}
-	if len(rf.snapshot) == args.Offset {
-		rf.snapshot = append(rf.snapshot, args.Data...)
-		rf.snapshotLastOffset = rf.snapshotLastOffset + len(args.Data)
-	} else {
-		if len(rf.snapshot) != args.Offset+len(args.Data) {
-			panic("TODO 幂等性失效，这里需要重新填写snapshot")
-		}
-	}
 	if !args.Done {
 		reply.Valid = true
 		reply.SnapshotLastIndex = rf.snapshotLastIndex
 		return
 	}
+	if rf.convertLocalIndex(args.LastIncludedIndex) > 0 && args.LastIncludedIndex < rf.getLastLogIndex() {
+		entry := rf.getEntryByIndexNoneLock(args.LastIncludedIndex)
+		if entry.Term == args.LastIncludedTerm {
+			rf.logs = rf.logs[rf.convertLocalIndex(args.LastIncludedIndex):]
+		} else {
+			rf.logs = []Entry{}
+		}
+	} else {
+		rf.logs = []Entry{}
+	}
 	rf.snapshotLastIndexTemp = -1
 	rf.snapshotLastOffset = 0
+	rf.snapshot = clone(args.Data)
+	rf.snapshotLastTerm = args.LastIncludedTerm
+	rf.snapshotLastIndex = args.LastIncludedIndex
 	DPrintf("[%v][%v][%v] success install a snapshot from leader\n", rf.me, rf.term, rf.snapshotLastIndex)
-	applyMsg := ApplyMsg{
-		CommandValid:  false,
-		SnapshotValid: true,
-		Snapshot:      clone(args.Data),
-		SnapshotIndex: args.LastIncludedIndex,
-		SnapshotTerm:  args.LastIncludedTerm,
-	}
 	rf.persistNoneLock()
-	lastAppliedTemp := rf.lastApplied
-	rf.snapshotApplyPendingNum += 1
-	rf.mu.Unlock()
-	rf.snapshotApplier <- applyMsg
-	rf.mu.Lock()
-	rf.snapshotApplyPendingNum -= 1
-	if rf.lastApplied == lastAppliedTemp {
-		rf.lastApplied = applyMsg.SnapshotIndex
-		rf.snapshotLastIndex = applyMsg.SnapshotIndex
-		rf.snapshotLastTerm = applyMsg.SnapshotTerm
-		// TODO:todo
-		reply.SnapshotLastIndex = rf.snapshotLastIndex
-	}
+	rf.applyCond.Signal()
 	reply.Valid = true
-
+	reply.SnapshotLastIndex = rf.snapshotLastIndex
+	return
 }
 func MineMax(x int, y int) int {
 	if x > y {
@@ -931,19 +927,17 @@ func (rf *Raft) sendAppendRequest(term int, peerId int, argsStatic RequestAppend
 		rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
 	}
 	DPrintf("[%v][%v][%v] receive success append apply from %v, nextIndex = %v, matchIndex = %v\n", rf.me, rf.term, rf.snapshotLastIndex, peerId, rf.nextIndex[peerId], rf.matchIndex[peerId])
-	if rf.snapshotApplyPendingNum == 0 {
-		for n := rf.snapshotLastIndex + len(rf.logs); n > rf.commitIndex; n-- {
-			cnt := 0
-			for _, idx := range rf.matchIndex {
-				if idx >= n {
-					cnt++
-				}
+	for n := rf.snapshotLastIndex + len(rf.logs); n > rf.commitIndex && n > rf.snapshotLastIndex; n-- {
+		cnt := 0
+		for _, idx := range rf.matchIndex {
+			if idx >= n {
+				cnt++
 			}
-			if cnt >= (len(rf.peers)+1)/2 && rf.logs[rf.convertLocalIndex(n)-1].Term == rf.term {
-				rf.commitIndex = n
-				rf.applyCond.Signal()
-				break
-			}
+		}
+		if cnt >= (len(rf.peers)+1)/2 && rf.logs[rf.convertLocalIndex(n)-1].Term == rf.term {
+			rf.commitIndex = n
+			rf.applyCond.Signal()
+			break
 		}
 	}
 	rf.mu.Unlock()
@@ -1233,34 +1227,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	return index, term, isLeader
 }
-func (rf *Raft) applierSnapshot() {
-	for m := range rf.snapshotApplier {
-		rf.CallerApplyCh <- m
-		rf.mu.Lock()
-		rf.lastApplied = m.SnapshotIndex
-		rf.snapshotApplyPendingNum -= 1
-		if rf.convertLocalIndex(m.SnapshotIndex) > 0 && m.SnapshotIndex < rf.getLastLogIndex() {
-			entry := rf.getEntryByIndexNoneLock(m.SnapshotIndex)
-			if entry.Term == m.SnapshotTerm {
-				rf.logs = rf.logs[rf.convertLocalIndex(m.SnapshotIndex):]
-			} else {
-				rf.logs = []Entry{}
-			}
-		} else {
-			rf.logs = []Entry{}
-		}
-		rf.snapshotLastIndex = m.SnapshotIndex
-		rf.snapshotLastTerm = m.SnapshotTerm
-		rf.persistNoneLock()
-		rf.mu.Unlock()
-
-	}
-}
-func (rf *Raft) applier() {
+func (rf *Raft) applier(initSnapshotLastIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.lastAppliedSnapshotIndex = initSnapshotLastIndex
 	for !rf.killed() {
-		if rf.commitIndex > rf.lastApplied && rf.snapshotApplyPendingNum == 0 {
+		if rf.snapshotLastIndex > rf.lastAppliedSnapshotIndex {
+			applyMsg := ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      clone(rf.snapshot),
+				SnapshotIndex: rf.snapshotLastIndex,
+				SnapshotTerm:  rf.snapshotLastTerm,
+			}
+			rf.lastAppliedSnapshotIndex = rf.snapshotLastIndex
+			rf.lastApplied = rf.snapshotLastIndex
+			rf.mu.Unlock()
+			rf.CallerApplyCh <- applyMsg
+			rf.mu.Lock()
+		} else if rf.commitIndex > rf.lastApplied {
+			DPrintf("[%v][%v][%v] apply index = %v\n", rf.me, rf.term, rf.snapshotLastIndex, rf.lastApplied+1)
 			msg := ApplyMsg{
 				CommandValid: true,
 				CommandIndex: rf.getEntryByIndexNoneLock(rf.lastApplied + 1).Index,
@@ -1268,6 +1254,7 @@ func (rf *Raft) applier() {
 				CommandTerm:  rf.getEntryByIndexNoneLock(rf.lastApplied + 1).Term}
 			rf.lastApplied += 1
 			rf.mu.Unlock()
+			// 这里不能确定snapshotPending == 0
 			rf.CallerApplyCh <- msg
 			rf.mu.Lock()
 		} else {
@@ -1290,10 +1277,6 @@ func (rf *Raft) Kill() {
 	// close req send loop
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//for _, ch := range rf.applyCh {
-	//	ch <- reqWarp{Req: RequestAppendEntries{}, Msg: Quit}
-	//	close(ch)
-	//}
 }
 
 func (rf *Raft) killed() bool {
@@ -1365,11 +1348,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = []Entry{}
 	rf.term = 0
 	rf.dead = 0
-	rf.snapshotApplyPendingNum = 0
 	rf.CallerApplyCh = applyCh
 	rf.snapshotLastTerm = 0
 	rf.snapshotLastIndex = 0
-	rf.snapshotApplier = make(chan ApplyMsg)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.commitIndex = rf.snapshotLastIndex
@@ -1377,26 +1358,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.lastApplied = rf.snapshotLastIndex
 	DPrintf("[%v][%v][%v] from persister's snapshot len = %v\n", rf.me, rf.term, rf.snapshotLastIndex, len(persister.ReadSnapshot()))
-	// TODO: Change
-
-	if rf.snapshotLastIndex > 0 {
-		rf.snapshotApplyPendingNum += 1
-		go func(m ApplyMsg) {
-			rf.snapshotApplier <- m
-		}(ApplyMsg{
-			CommandValid:  false,
-			SnapshotValid: true,
-			Snapshot:      clone(rf.snapshot),
-			SnapshotIndex: rf.snapshotLastIndex,
-			SnapshotTerm:  rf.snapshotLastTerm,
-		})
-	}
 	rf.state = Follower
 	rf.voteGet = 0
-
 	go rf.ticker()
-	go rf.applier()
-	go rf.applierSnapshot()
-
+	go rf.applier(rf.snapshotLastIndex)
 	return rf
 }
