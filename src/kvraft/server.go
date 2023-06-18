@@ -45,12 +45,53 @@ const (
 	OpUnknown OpRes = 2
 )
 
+type ClientId struct {
+	ClerkId       int
+	NextCallIndex bool
+}
+
+func (cd *ClientId) previousCallIndex() ClientId {
+	return ClientId{ClerkId: cd.ClerkId, NextCallIndex: !cd.NextCallIndex}
+}
+
 type OpChan struct {
 	expectTerm int
 	op         Op
 	cond       *sync.Cond
 	opRes      OpRes
+	index      int
 }
+
+// 错误处理应该指导分支，而不是直接退出
+type CacheTable struct {
+	dupTable map[ClientId]*OpChan
+	IndexId  map[int]ClientId
+}
+
+func (ct *CacheTable) insert(clientId ClientId, op *OpChan) {
+	ct.dupTable[clientId] = op
+	ct.IndexId[op.index] = clientId
+}
+func (ct *CacheTable) tryGetOpChan(id ClientId) (*OpChan, bool) {
+	res, ok := ct.dupTable[id]
+	return res, ok
+}
+func (ct *CacheTable) clearByClientId(id ClientId) {
+	//delete(ct.dupTable, id)
+	if res, ok := ct.dupTable[id]; ok {
+		index := res.index
+		delete(ct.IndexId, index)
+		delete(ct.dupTable, id)
+	}
+}
+func (ct *CacheTable) clearByPreviousId(id ClientId) {
+	pid := ClientId{
+		ClerkId:       id.ClerkId,
+		NextCallIndex: !id.NextCallIndex,
+	}
+	ct.clearByClientId(pid)
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -62,10 +103,10 @@ type KVServer struct {
 
 	// Your definitions here.
 	stateMachine      map[string]string
-	pendingOps        map[int]*OpChan // key = index
-	dupTable          map[int]*OpChan // key = id
-	indexId           map[int]int     // key = index, value = id
-	idIndex           map[int]int     // key = id, value = index
+	pendingOps        map[int]*OpChan      // key = index
+	dupTable          map[ClientId]*OpChan // key = id
+	indexId           map[int]ClientId     // key = index, value = id
+	idIndex           map[ClientId]int     // key = id, value = index
 	maxCommitIndex    int
 	snapshot          []byte
 	snapshotLastIndex int
@@ -133,8 +174,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	op := Op{}
+	clientId := ClientId{
+		ClerkId:       args.ClerkId,
+		NextCallIndex: args.NextCallIndex,
+	}
 	kv.MyDebugNoneLock("get a PutAppend req = %v\n", args)
-	res, ok := kv.dupTable[args.Rid]
+	res, ok := kv.dupTable[clientId]
 	if ok == false {
 
 		if args.Op == "Put" {
@@ -163,9 +208,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			op:         op,
 		}
 		kv.pendingOps[index] = &opChan
-		kv.dupTable[args.Rid] = &opChan
-		kv.indexId[index] = args.Rid
-		kv.idIndex[args.Rid] = index
+		kv.dupTable[clientId] = &opChan
+		kv.indexId[index] = clientId
+		kv.idIndex[clientId] = index
 		// 如果长时间没有commit，那就直接没了。
 		// 最好的方案还是修改raft，然后搞一个失败chan
 		kv.mu.Unlock()
@@ -249,9 +294,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.idIndex = make(map[int]int)
-	kv.indexId = make(map[int]int)
-	kv.dupTable = make(map[int]*OpChan)
+	kv.idIndex = make(map[ClientId]int)
+	kv.indexId = make(map[int]ClientId)
+	kv.dupTable = make(map[ClientId]*OpChan)
 	kv.pendingOps = make(map[int]*OpChan)
 	kv.snapshotLastIndex = 0
 	kv.maxCommitIndex = kv.snapshotLastIndex

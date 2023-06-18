@@ -13,9 +13,13 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	// leader缓存，减少rpc的调用。
-	nowLeader int
+	nowLeader     int
+	clerkId       int
+	nextCallIndex bool // 0 or 1
 }
 
+// 为了简单实现，这里就用全局变量了。
+// 如果需要更强的通用性以及安全性，可以考虑向server进行注册。
 var nextIndex int = 0
 var nmu sync.Mutex = sync.Mutex{}
 
@@ -30,6 +34,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.nowLeader = 0 //假设0成为了leader
+	ck.nextCallIndex = false
+	nmu.Lock()
+	ck.clerkId = nextIndex
+	nextIndex += 1
+	nmu.Unlock()
 	// You'll have to add code here.
 	return ck
 }

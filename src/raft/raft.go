@@ -76,8 +76,9 @@ type Raft struct {
 	hasVoted             bool  // only when in follower state is valid. every time when term update, the hasVote will reset to false
 	lastVotedCandidateId int
 	getMsg               bool
-	lastHeartBeatOver    []bool
+	lastRPCOver          []bool
 	applyCond            *sync.Cond
+	sendingRPC           []bool
 	//applyCh              []chan reqWarp
 	// below if (2B)
 	logs        []Entry
@@ -233,9 +234,7 @@ func (rf *Raft) convertToLeaderConfigNoneLock() {
 			rf.nextIndex[i] = rf.logs[len(rf.logs)-1].Index + 1
 		}
 		rf.matchIndex[i] = 0
-		rf.lastHeartBeatOver[i] = true
-		//rf.applyCh[i] = make(chan reqWarp, 100)
-		//go rf.onePeerOneChannelConcurrent(i, rf.term, rf.applyCh[i])
+		rf.lastRPCOver[i] = true
 	}
 	rf.lastVotedCandidateId = -1
 	rf.hasVoted = false
@@ -1330,13 +1329,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.nextIndex = []int{}
 	rf.matchIndex = []int{}
+	rf.lastRPCOver = []bool{}
 	//rf.applyCh = []chan reqWarp{}
 	// 为1的ch
 	rf.heartBeatChan = make(chan int)
 	for _, _ = range peers {
 		rf.nextIndex = append(rf.nextIndex, 1)
 		rf.matchIndex = append(rf.matchIndex, 0)
-		rf.lastHeartBeatOver = append(rf.lastHeartBeatOver, true)
+		rf.lastRPCOver = append(rf.lastRPCOver, true)
 		//rf.applyCh = append(rf.applyCh, make(chan reqWarp, 10000))
 	}
 	rf.commitIndex = 0
