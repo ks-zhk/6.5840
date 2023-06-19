@@ -88,6 +88,9 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	return ""
 }
+func (ck *Clerk) PutAppendSpecificServer(server *labrpc.ClientEnd, cond *sync.Cond, key string, value string, op string) {
+
+}
 
 // shared by Put and Append.
 //
