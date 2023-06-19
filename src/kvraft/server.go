@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -17,10 +17,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
-func (kv *KVServer) MyDebugNoneLock(format string, a ...interface{}) {
-	DPrintf("KVServer id = %v", kv.me)
-	DPrintf(format, a...)
-}
+
+//func (kv *KVServer) MyDebugNoneLock(format string, a ...interface{}) {
+//	DPrintf("KVServer id = %v", kv.me)
+//	DPrintf(format, a...)
+//}
 
 type Op struct {
 	// Your definitions here.
@@ -63,6 +64,7 @@ type OpChan struct {
 }
 
 // 错误处理应该指导分支，而不是直接退出
+// 不应该侵占任何其他逻辑，做好本分的增删改查即可
 type CacheTable struct {
 	dupTable map[ClientId]*OpChan
 	IndexId  map[int]ClientId
@@ -76,6 +78,14 @@ func (ct *CacheTable) tryGetOpChan(id ClientId) (*OpChan, bool) {
 	res, ok := ct.dupTable[id]
 	return res, ok
 }
+func (ct *CacheTable) tryGetByIndex(idx int) (*OpChan, bool) {
+	if id, ok := ct.IndexId[idx]; ok {
+		if op, okk := ct.dupTable[id]; okk {
+			return op, true
+		}
+	}
+	return nil, false
+}
 func (ct *CacheTable) clearByClientId(id ClientId) {
 	//delete(ct.dupTable, id)
 	if res, ok := ct.dupTable[id]; ok {
@@ -85,10 +95,7 @@ func (ct *CacheTable) clearByClientId(id ClientId) {
 	}
 }
 func (ct *CacheTable) clearByPreviousId(id ClientId) {
-	pid := ClientId{
-		ClerkId:       id.ClerkId,
-		NextCallIndex: !id.NextCallIndex,
-	}
+	pid := id.previousCallIndex()
 	ct.clearByClientId(pid)
 }
 
@@ -103,10 +110,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	stateMachine      map[string]string
-	pendingOps        map[int]*OpChan      // key = index
-	dupTable          map[ClientId]*OpChan // key = id
-	indexId           map[int]ClientId     // key = index, value = id
-	idIndex           map[ClientId]int     // key = id, value = index
+	cacheTable        CacheTable
 	maxCommitIndex    int
 	snapshot          []byte
 	snapshotLastIndex int
@@ -117,13 +121,13 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 		if !msg.SnapshotValid && !msg.CommandValid {
 			return
 		}
-		kv.MyDebugNoneLock("get a commit %v\n", msg)
+		DPrintf("[%v] get a commit %v\n", kv.me, msg)
 		if msg.CommandValid {
 			kv.mu.Lock()
 			index := msg.CommandIndex
 			term := msg.CommandTerm
-			if opc, ok := kv.pendingOps[index]; ok && msg.CommandIndex > kv.maxCommitIndex {
-				kv.MyDebugNoneLock("hit the pending index = %v\n", index)
+			if opc, ok := kv.cacheTable.tryGetByIndex(index); ok && msg.CommandIndex > kv.maxCommitIndex {
+				DPrintf("[%v] hit the pending index = %v\n", kv.me, index)
 				opc.cond.L.Lock()
 				if opc.opRes == OpUnknown {
 					if opc.expectTerm == term {
@@ -160,6 +164,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// TODO: 思考，是否需要进行leader判断。还是进行majority获取
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		reply.Value = ""
+		return
+	}
 	if m, ok := kv.stateMachine[args.Key]; ok {
 		reply.Err = OK
 		reply.Value = m
@@ -174,14 +183,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	op := Op{}
-	clientId := ClientId{
-		ClerkId:       args.ClerkId,
-		NextCallIndex: args.NextCallIndex,
-	}
-	kv.MyDebugNoneLock("get a PutAppend req = %v\n", args)
-	res, ok := kv.dupTable[clientId]
+	clientId := ClientId{ClerkId: args.ClerkId, NextCallIndex: args.NextCallIndex}
+	kv.cacheTable.clearByClientId(clientId.previousCallIndex())
+	DPrintf("[%v] get a PutAppend req = %v\n", kv.me, args)
+	res, ok := kv.cacheTable.tryGetOpChan(clientId)
 	if ok == false {
-
 		if args.Op == "Put" {
 			op.Type = PutOp
 		} else if args.Op == "Append" {
@@ -196,25 +202,23 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		index, term, isLeader := kv.rf.Start(op)
 
 		if !isLeader {
-			kv.MyDebugNoneLock("this req is fresh new, however this server is not leader, just return reply\n")
+			DPrintf("[%v] this req is fresh new, however this server is not leader, just return reply\n", kv.me)
 			reply.Err = ErrWrongLeader
 			kv.mu.Unlock()
 			return
 		}
-		kv.MyDebugNoneLock("this req is fresh new, and this server is a leader, try to start\n")
+		DPrintf("[%v] this req is fresh new, and this server is a leader, try to start\n", kv.me)
 		opChan := OpChan{
 			cond:       sync.NewCond(&sync.Mutex{}),
 			expectTerm: term,
 			op:         op,
+			index:      index,
 		}
-		kv.pendingOps[index] = &opChan
-		kv.dupTable[clientId] = &opChan
-		kv.indexId[index] = clientId
-		kv.idIndex[clientId] = index
-		// 如果长时间没有commit，那就直接没了。
-		// 最好的方案还是修改raft，然后搞一个失败chan
+		opChan.opRes = OpUnknown
+		kv.cacheTable.insert(clientId, &opChan)
 		kv.mu.Unlock()
 		opChan.cond.L.Lock()
+		DPrintf("[%v] success lock the cond lock\n", kv.me)
 		for opChan.opRes == OpUnknown {
 			opChan.cond.Wait()
 		}
@@ -225,6 +229,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 		opChan.cond.L.Unlock()
 	} else {
+		kv.mu.Unlock()
 		res.cond.L.Lock()
 		for res.opRes == OpUnknown {
 			res.cond.Wait()
@@ -240,7 +245,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Ack(args *AckArgs, reply *AckReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -294,14 +298,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.idIndex = make(map[ClientId]int)
-	kv.indexId = make(map[int]ClientId)
-	kv.dupTable = make(map[ClientId]*OpChan)
-	kv.pendingOps = make(map[int]*OpChan)
+	kv.cacheTable = CacheTable{
+		dupTable: make(map[ClientId]*OpChan),
+		IndexId:  make(map[int]ClientId),
+	}
 	kv.snapshotLastIndex = 0
 	kv.maxCommitIndex = kv.snapshotLastIndex
 	kv.stateMachine = make(map[string]string)
 	kv.dead = 0
+	go kv.applier(kv.applyCh)
 	// You may need initialization code here.
 
 	return kv

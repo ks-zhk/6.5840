@@ -20,7 +20,6 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 	ClerkId       int
 	NextCallIndex bool
-	Rid           int
 }
 
 type PutAppendReply struct {

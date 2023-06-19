@@ -54,7 +54,37 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-
+	DPrintf("[%v] try to get value by key = %v\n", ck.clerkId, key)
+	args := GetArgs{
+		Key: key,
+	}
+	reply := GetReply{}
+	res := false
+	for {
+		res = false
+		for res == false {
+			reply = GetReply{}
+			res = ck.servers[ck.nowLeader].Call("KVServer.Get", &args, &reply)
+		}
+		DPrintf("[%v] get a reply = %v\n", ck.clerkId, reply)
+		for reply.Err == ErrWrongLeader {
+			ck.nowLeader = (ck.nowLeader + 1) % len(ck.servers)
+			res = false
+			for res == false {
+				reply = GetReply{}
+				res = ck.servers[ck.nowLeader].Call("KVServer.Get", &args, &reply)
+			}
+		}
+		if reply.Err == ErrNoKey {
+			break
+		}
+		if reply.Err == ErrNoSupportOp {
+			panic("not support get")
+		}
+		if reply.Err == OK {
+			return reply.Value
+		}
+	}
 	// You will have to modify this function.
 	return ""
 }
@@ -69,11 +99,49 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.nextCallIndex = !ck.nextCallIndex
+	args := PutAppendArgs{
+		Key:           key,
+		Value:         value,
+		Op:            op,
+		ClerkId:       ck.clerkId,
+		NextCallIndex: ck.nextCallIndex,
+	}
+	reply := PutAppendReply{}
+	res := false
+	// check a leader
+	for {
+		res = false
+		for res == false {
+			reply = PutAppendReply{}
+			res = ck.servers[ck.nowLeader].Call("KVServer.PutAppend", &args, &reply)
+		}
+		DPrintf("[%v] get a reply = %v\n", ck.clerkId, reply)
+		for reply.Err == ErrWrongLeader {
+			ck.nowLeader = (ck.nowLeader + 1) % len(ck.servers)
+			res = false
+			for res == false {
+				reply = PutAppendReply{}
+				res = ck.servers[ck.nowLeader].Call("KVServer.PutAppend", &args, &reply)
+			}
+		}
+		if reply.Err == ErrCommitFailed {
+			continue
+		}
+		if reply.Err == ErrNoSupportOp {
+			panic("not support op")
+		}
+		break
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
+	DPrintf("[%v] try to Put key = %v, value = %v\n", ck.clerkId, key, value)
 	ck.PutAppend(key, value, "Put")
+	DPrintf("[%v] success Put key = %v, value = %v\n", ck.clerkId, key, value)
 }
 func (ck *Clerk) Append(key string, value string) {
+	DPrintf("[%v] try to Append key = %v, value = %v\n", ck.clerkId, key, value)
 	ck.PutAppend(key, value, "Append")
+	DPrintf("[%v] success Append key = %v, value = %v\n", ck.clerkId, key, value)
 }
