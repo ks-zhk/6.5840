@@ -1,6 +1,9 @@
 package kvraft
 
-import "6.5840/porcupine"
+import (
+	"6.5840/porcupine"
+	"log"
+)
 import "6.5840/models"
 import "testing"
 import "strconv"
@@ -58,7 +61,6 @@ func Get(cfg *config, ck *Clerk, key string, log *OpLog, cli int) string {
 			ClientId: cli,
 		})
 	}
-
 	return v
 }
 
@@ -307,13 +309,14 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
 
 		if partitions {
-			// log.Printf("wait for partitioner\n")
+			log.Printf("wait for partitioner\n")
 			<-ch_partitioner
 			// reconnect network and submit a request. A client may
 			// have submitted a request in a minority.  That request
 			// won't return until that server discovers a new term
 			// has started.
 			cfg.ConnectAll()
+			log.Printf("Connect ALL\n")
 			// wait for a while so that we have a new term
 			time.Sleep(electionTimeout)
 		}
@@ -334,7 +337,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 			cfg.ConnectAll()
 		}
 
-		// log.Printf("wait for clients\n")
+		log.Printf("wait for clients\n")
 		for i := 0; i < nclients; i++ {
 			// log.Printf("read from clients %d\n", i)
 			j := <-clnts[i]

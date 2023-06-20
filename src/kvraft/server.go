@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = true
@@ -27,15 +28,17 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type OpType
-	Key  string
-	Args string
+	Type     OpType
+	Key      string
+	Args     string
+	ClientId ClientId
 }
 type OpType int
 
 const (
 	AppendOp OpType = 0
 	PutOp    OpType = 1
+	GetLog   OpType = 2
 )
 
 type OpRes int
@@ -61,6 +64,7 @@ type OpChan struct {
 	cond       *sync.Cond
 	opRes      OpRes
 	index      int
+	val        string
 }
 
 // 错误处理应该指导分支，而不是直接退出
@@ -99,6 +103,13 @@ func (ct *CacheTable) clearByPreviousId(id ClientId) {
 	ct.clearByClientId(pid)
 }
 
+type GetWait struct {
+	cond     *sync.Cond
+	res      string
+	key      string
+	exit     bool
+	finished bool
+}
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -111,9 +122,10 @@ type KVServer struct {
 	// Your definitions here.
 	stateMachine      map[string]string
 	cacheTable        CacheTable
-	maxCommitIndex    int
+	lastApplied       int
 	snapshot          []byte
 	snapshotLastIndex int
+	wTable            map[int]*GetWait // Get的等待表
 }
 
 func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
@@ -121,37 +133,103 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 		if !msg.SnapshotValid && !msg.CommandValid {
 			return
 		}
-		DPrintf("[%v] get a commit %v\n", kv.me, msg)
+		//DPrintf("[s %v] get a commit %v\n", kv.me, msg)
 		if msg.CommandValid {
 			kv.mu.Lock()
 			index := msg.CommandIndex
 			term := msg.CommandTerm
-			if opc, ok := kv.cacheTable.tryGetByIndex(index); ok && msg.CommandIndex > kv.maxCommitIndex {
-				DPrintf("[%v] hit the pending index = %v\n", kv.me, index)
-				opc.cond.L.Lock()
-				if opc.opRes == OpUnknown {
-					if opc.expectTerm == term {
-						opc.opRes = OpResOk
-					} else {
-						opc.opRes = OpResFail
+			if op, ok := msg.Command.(Op); ok {
+				DPrintf("[s %v] get a command apply, command = %v\n", kv.me, msg)
+				if msg.CommandIndex > kv.lastApplied {
+					if op.Type == AppendOp {
+						if m, ok := kv.stateMachine[op.Key]; ok {
+							m += op.Args
+							kv.stateMachine[op.Key] = m
+						} else {
+							kv.stateMachine[op.Key] = op.Args
+						}
 					}
-					opc.cond.Broadcast()
-				}
-				opc.cond.L.Unlock()
-			}
-			if op, ok := msg.Command.(Op); ok && msg.CommandIndex > kv.maxCommitIndex {
-				if op.Type == AppendOp {
-					if m, ok := kv.stateMachine[op.Key]; ok {
-						m += op.Args
-						kv.stateMachine[op.Key] = m
-					} else {
+					if op.Type == PutOp {
 						kv.stateMachine[op.Key] = op.Args
 					}
+					kv.lastApplied = msg.CommandIndex
 				}
-				if op.Type == PutOp {
-					kv.stateMachine[op.Key] = op.Args
+				for _, v := range kv.cacheTable.dupTable {
+					if v.index == msg.CommandIndex && v.expectTerm == msg.CommandTerm {
+						v.cond.L.Lock()
+						if op.Type == GetLog {
+							if val, ok := kv.stateMachine[op.Key]; ok {
+								v.val = val
+							} else {
+								v.val = ""
+							}
+						}
+						if v.opRes == OpUnknown {
+							if v.expectTerm == term && v.index == index {
+								v.opRes = OpResOk
+							} else {
+								v.opRes = OpResFail
+							}
+							v.cond.Broadcast()
+						}
+						v.cond.L.Unlock()
+					} else if v.index == msg.CommandIndex && v.expectTerm != msg.CommandTerm {
+						v.cond.L.Lock()
+						v.opRes = OpResFail
+						v.cond.Broadcast()
+						v.cond.L.Unlock()
+					} else {
+						if v.index > msg.CommandIndex && v.expectTerm < msg.CommandTerm {
+							// FAIL
+							v.cond.L.Lock()
+							v.opRes = OpResFail
+							v.cond.Broadcast()
+							v.cond.L.Unlock()
+						}
+						if v.index < msg.CommandIndex && v.expectTerm > msg.CommandTerm {
+							panic("should appear in snapshot!!")
+						}
+					}
 				}
-				kv.maxCommitIndex = msg.CommandIndex
+				//if opc, ok := kv.cacheTable.tryGetOpChan(op.ClientId); ok {
+				//	opc.cond.L.Lock()
+				//	if op.Type == GetLog {
+				//		if val, ok := kv.stateMachine[op.Key]; ok {
+				//			opc.val = val
+				//		} else {
+				//			opc.val = ""
+				//		}
+				//	}
+				//	if opc.opRes == OpUnknown {
+				//		if opc.expectTerm == term && opc.index == index {
+				//			opc.opRes = OpResOk
+				//		} else {
+				//			opc.opRes = OpResFail
+				//		}
+				//		opc.cond.Broadcast()
+				//	}
+				//	opc.cond.L.Unlock()
+				//}
+				//if opc, ok := kv.cacheTable.tryGetByIndex(index); ok {
+				//	opc.cond.L.Lock()
+				//	if op.Type == GetLog {
+				//		if val, ok := kv.stateMachine[op.Key]; ok {
+				//			opc.val = val
+				//		} else {
+				//			opc.val = ""
+				//		}
+				//	}
+				//	if opc.opRes == OpUnknown {
+				//		if opc.expectTerm == term {
+				//			opc.opRes = OpResOk
+				//		} else {
+				//			opc.opRes = OpResFail
+				//		}
+				//		opc.cond.Broadcast()
+				//	}
+				//	opc.cond.L.Unlock()
+				//}
+				//if opc, ok := kv.cacheTable.tryGetOpChan()
 			}
 			kv.mu.Unlock()
 		} else {
@@ -159,7 +237,52 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 		}
 	}
 }
+func (kv *KVServer) heartBeat() {
+	for !kv.killed() {
+		//kv.PutAppend(args.)
+		time.Sleep(time.Second)
+	}
+}
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	for {
+		kv.mu.Lock()
+		if kv.lastApplied >= args.MinIndex {
+			if m, ok := kv.stateMachine[args.Key]; ok {
+				reply.Err = OK
+				reply.Value = m
+			} else {
+				reply.Err = ErrNoKey
+				reply.Value = ""
+			}
+			reply.LastApplied = kv.lastApplied
+			kv.mu.Unlock()
+			break
+		} else {
+			DPrintf("[%v] kv.lastApplied = %v, MinIndex = %v\n", kv.me, kv.lastApplied, args.MinIndex)
+			var gw *GetWait
+			lck := sync.Mutex{}
+			ok := false
+			if gw, ok = kv.wTable[args.MinIndex]; !ok {
+				gw = &GetWait{
+					cond: sync.NewCond(&lck),
+					res:  "",
+					exit: false,
+					key:  args.Key,
+				}
+				kv.wTable[args.MinIndex] = gw
+			}
+			kv.mu.Unlock()
+			gw.cond.L.Lock()
+			for gw.finished == false {
+				gw.cond.Wait()
+			}
+			gw.cond.L.Unlock()
+			continue
+		}
+	}
+	return
+}
+func (kv *KVServer) GetFromLeader(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	// TODO: 思考，是否需要进行leader判断。还是进行majority获取
 	kv.mu.Lock()
@@ -178,20 +301,21 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	return
 }
-
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	op := Op{}
 	clientId := ClientId{ClerkId: args.ClerkId, NextCallIndex: args.NextCallIndex}
 	kv.cacheTable.clearByClientId(clientId.previousCallIndex())
-	DPrintf("[%v] get a PutAppend req = %v\n", kv.me, args)
+	//DPrintf("[%v] get a PutAppend req = %v\n", kv.me, args)
 	res, ok := kv.cacheTable.tryGetOpChan(clientId)
 	if ok == false {
 		if args.Op == "Put" {
 			op.Type = PutOp
 		} else if args.Op == "Append" {
 			op.Type = AppendOp
+		} else if args.Op == "GetLog" {
+			op.Type = GetLog
 		} else {
 			reply.Err = ErrNoSupportOp
 			kv.mu.Unlock()
@@ -199,21 +323,24 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 		op.Key = args.Key
 		op.Args = args.Value
+		op.ClientId = clientId
 		index, term, isLeader := kv.rf.Start(op)
 
 		if !isLeader {
-			DPrintf("[%v] this req is fresh new, however this server is not leader, just return reply\n", kv.me)
+			//DPrintf("[%v] this req is fresh new, however this server is not leader, just return reply\n", kv.me)
 			reply.Err = ErrWrongLeader
 			kv.mu.Unlock()
 			return
 		}
-		DPrintf("[%v] this req is fresh new, and this server is a leader, try to start\n", kv.me)
+
+		DPrintf("[%v][%v] this req %v is fresh new, and this server is a leader, try to start\n", kv.me, term, args)
 		opChan := OpChan{
 			cond:       sync.NewCond(&sync.Mutex{}),
 			expectTerm: term,
 			op:         op,
 			index:      index,
 		}
+		DPrintf("[%v] opchan = %v\n", kv.me, opChan)
 		opChan.opRes = OpUnknown
 		kv.cacheTable.insert(clientId, &opChan)
 		kv.mu.Unlock()
@@ -224,8 +351,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 		if opChan.opRes == OpResFail {
 			reply.Err = ErrCommitFailed
+			reply.Value = opChan.val
+			DPrintf("[%v] in first fail apply key = %v, opchan = %v\n", kv.me, args.Key, opChan)
 		} else {
 			reply.Err = OK
+			reply.LogIndex = index
+			reply.Value = opChan.val
+			DPrintf("[%v] in first success apply key = %v, opchan = %v\n", kv.me, args.Key, opChan)
+		}
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			reply.Err = ErrWrongLeader
 		}
 		opChan.cond.L.Unlock()
 	} else {
@@ -236,8 +371,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 		if res.opRes == OpResFail {
 			reply.Err = ErrCommitFailed
+			reply.Value = res.val
+			DPrintf("[%v] in dup apply key = %v, opchan = %v\n", kv.me, args.Key, res)
 		} else {
 			reply.Err = OK
+			reply.LogIndex = res.index
+			reply.Value = res.val
+			DPrintf("[%v] in dup success apply key = %v, opchan = %v\n", kv.me, args.Key, res)
+		}
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			reply.Err = ErrWrongLeader
 		}
 		res.cond.L.Unlock()
 	}
@@ -302,8 +445,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		dupTable: make(map[ClientId]*OpChan),
 		IndexId:  make(map[int]ClientId),
 	}
+	kv.wTable = make(map[int]*GetWait)
 	kv.snapshotLastIndex = 0
-	kv.maxCommitIndex = kv.snapshotLastIndex
+	kv.lastApplied = kv.snapshotLastIndex
 	kv.stateMachine = make(map[string]string)
 	kv.dead = 0
 	go kv.applier(kv.applyCh)

@@ -21,6 +21,7 @@ import (
 	"6.5840/labgob"
 	"bytes"
 	"errors"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -227,6 +228,7 @@ func (rf *Raft) lockWithCheckForLeader(term int) bool {
 // idx ok
 func (rf *Raft) convertToLeaderConfigNoneLock() {
 	DPrintf("[%v][%v][%v] become leader\n", rf.me, rf.term, rf.snapshotLastIndex)
+	log.Printf("[%v][%v][%v] become leader\n", rf.me, rf.term, rf.snapshotLastIndex)
 	for i := 0; i < len(rf.peers); i++ {
 		if len(rf.logs) == 0 {
 			rf.nextIndex[i] = rf.snapshotLastIndex + 1
@@ -327,6 +329,7 @@ func (rf *Raft) becomeCandidateNoneLock() {
 	DPrintf("[%v][%v][%v] try to persist in becomeCandidateNoneLock\n", rf.me, rf.term, rf.snapshotLastIndex)
 	rf.persistNoneLock()
 	DPrintf("[%v][%v][%v] become candidate\n", rf.me, rf.term, rf.snapshotLastIndex)
+	log.Printf("[%v][%v][%v] become candidate\n", rf.me, rf.term, rf.snapshotLastIndex)
 }
 
 // save Raft's persistent state to stable storage,
@@ -692,6 +695,7 @@ func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendE
 		reply.Success = true
 	} else {
 		// leader
+		panic("multi leader in raft")
 		reply.Success = false
 	}
 	// fmt.Printf("in %v, log = %v\n", rf.me, rf.logs)
@@ -700,6 +704,7 @@ func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendE
 
 func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 	DPrintf("[%v][%v][%v] become follower with new term %v\n", rf.me, rf.term, rf.snapshotLastIndex, newTerm)
+	log.Printf("[%v][%v][%v] become follower with new term %v\n", rf.me, rf.term, rf.snapshotLastIndex, newTerm)
 	rf.term = newTerm
 	rf.state = Follower
 	rf.hasVoted = false
@@ -1187,14 +1192,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 	rf.mu.Lock()
-	DPrintf("[%v][%v][%v] get a command = %v\n", rf.me, rf.term, rf.snapshotLastIndex, command)
+	//DPrintf("[%v][%v][%v] get a command = %v\n", rf.me, rf.term, rf.snapshotLastIndex, command)
 	defer rf.mu.Unlock()
 	//defer DPrintf("[%v][%v] in start defer logs = %v\n", rf.me, rf.term, rf.logs)
 	isLeader = rf.state == Leader
 	if !isLeader || rf.killed() {
-		DPrintf("[%v][%v][%v] is not leader, return false\n", rf.me, rf.term, rf.snapshotLastIndex)
+		//DPrintf("[%v][%v][%v] is not leader, return false\n", rf.me, rf.term, rf.snapshotLastIndex)
 		return index, term, isLeader
 	}
+	DPrintf("[%v][%v][%v] LEADER! get command = %v\n", rf.me, rf.term, rf.snapshotLastIndex, command)
 	// Your code here (2B).
 	rf.logs = append(rf.logs, Entry{
 		Term:    rf.term,
@@ -1290,6 +1296,14 @@ const (
 	BecomeFollower ElectionMsg = 3
 )
 
+func (rf *Raft) debugTermLoop() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		log.Printf("in raft, [%v] 's term = %v\n", rf.me, rf.term)
+		rf.mu.Unlock()
+		time.Sleep(time.Second)
+	}
+}
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (2A)
@@ -1361,5 +1375,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteGet = 0
 	go rf.ticker()
 	go rf.applier(rf.snapshotLastIndex)
+	go rf.debugTermLoop()
 	return rf
 }
