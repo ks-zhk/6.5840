@@ -19,7 +19,7 @@ type PutAppendArgs struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	ClerkId       int
-	NextCallIndex bool
+	NextCallIndex int
 }
 
 type PutAppendReply struct {

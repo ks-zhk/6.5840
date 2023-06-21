@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"6.5840/utils"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -18,11 +19,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
-
-//func (kv *KVServer) MyDebugNoneLock(format string, a ...interface{}) {
-//	DPrintf("KVServer id = %v", kv.me)
-//	DPrintf(format, a...)
-//}
 
 type Op struct {
 	// Your definitions here.
@@ -39,6 +35,7 @@ const (
 	AppendOp OpType = 0
 	PutOp    OpType = 1
 	GetLog   OpType = 2
+	NoneOp   OpType = 3
 )
 
 type OpRes int
@@ -51,17 +48,17 @@ const (
 
 type ClientId struct {
 	ClerkId       int
-	NextCallIndex bool
+	NextCallIndex int
 }
 
 func (cd *ClientId) previousCallIndex() ClientId {
-	return ClientId{ClerkId: cd.ClerkId, NextCallIndex: !cd.NextCallIndex}
+	return ClientId{ClerkId: cd.ClerkId, NextCallIndex: cd.NextCallIndex - 1}
 }
 
 type OpChan struct {
 	expectTerm int
 	op         Op
-	cond       *sync.Cond
+	cond       *utils.MCond
 	opRes      OpRes
 	index      int
 	val        string
@@ -128,7 +125,124 @@ type KVServer struct {
 	wTable            map[int]*GetWait // Get的等待表
 }
 
+func (kv *KVServer) applyCommand(op Op) string {
+	if op.Type == AppendOp {
+		if m, ok := kv.stateMachine[op.Key]; ok {
+			m += op.Args
+			kv.stateMachine[op.Key] = m
+		} else {
+			kv.stateMachine[op.Key] = op.Args
+		}
+	}
+	if op.Type == PutOp {
+		kv.stateMachine[op.Key] = op.Args
+	}
+	if res, ok := kv.stateMachine[op.Key]; ok {
+		return res
+	} else {
+		return ""
+	}
+}
+
+//func (kv *KVServer) clearStaleLogs(msg raft.ApplyMsg) {
+//	if _, ok := msg.Command.(Op); ok {
+//
+//	}
+//}
+
+// put a no-op into this server, to update the commit to the latest, for updating the server.cacheTable to the latest
+func (kv *KVServer) putNoneOp() Err {
+	kv.mu.Lock()
+	DPrintf("[server %v] in putNoneOp\n", kv.me)
+	clientId := ClientId{
+		ClerkId:       0, // not exit clientId
+		NextCallIndex: 0,
+	}
+	op := Op{
+		Type:     NoneOp,
+		Key:      "",
+		Args:     "",
+		ClientId: clientId,
+	}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		return ErrWrongLeader
+	}
+	DPrintf("[server %v] wait for PutNoneOp Success\n", kv.me)
+	opChan := &OpChan{
+		cond:       utils.NewCond(&sync.Mutex{}),
+		expectTerm: term,
+		op:         op,
+		opRes:      OpUnknown,
+		index:      index,
+		val:        "",
+	}
+	kv.cacheTable.insert(clientId, opChan)
+	kv.mu.Unlock()
+	opChan.cond.L.Lock()
+	if opChan.opRes == OpUnknown {
+		opChan.cond.WaitWithTimeout(time.Second)
+	}
+	DPrintf("[server %v] opRes = %v\n", kv.me, opChan.opRes)
+	var err Err
+	if opChan.opRes == OpUnknown || opChan.opRes == OpResFail {
+		err = ErrCommitFailed
+	} else {
+		err = OK
+	}
+	opChan.cond.L.Unlock()
+	return err
+}
 func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
+	for msg := range ch {
+		if kv.killed() {
+			return
+		}
+		if msg.CommandValid {
+			kv.mu.Lock()
+			if op, ok := msg.Command.(Op); ok && msg.CommandIndex > kv.lastApplied {
+				if opChan, ok := kv.cacheTable.tryGetOpChan(op.ClientId); ok {
+					val := kv.applyCommand(op)
+					opChan.cond.L.Lock()
+					opChan.val = val
+					if opChan.opRes == OpUnknown {
+						if opChan.index == msg.CommandIndex && opChan.expectTerm == msg.CommandTerm {
+							opChan.opRes = OpResOk
+						} else {
+							opChan.opRes = OpResFail
+						}
+					}
+					opChan.cond.Broadcast()
+					opChan.cond.L.Unlock()
+				} else {
+					// 添加一下这一步非常关键。但是呢，返回只是它commit了，不代表server也commit了，
+					// 这只能防止一部分情况
+					// 还需要添加额外的限制来进行防止。
+					// 如何解决这个问题 client_request -> hit leader, start, success replicate, commit -> reply error -> become follower,
+					// client_request -> hit new leader, -> .....
+					// 解决方案：在每次append之前，判断当前server是否进行了部分转换，如果进行了转换，则现进行一次None-op的append，用于将该server中的所有log进行一次commit
+					// 最逆天的解决方案：每次append之前，都直接put一个空操作。
+					// 驱使下方代码的执行！。完美解决了兄弟们。
+					if op.Type != NoneOp {
+						opChan := OpChan{
+							expectTerm: msg.CommandTerm,
+							op:         op,
+							cond:       utils.NewCond(&sync.Mutex{}),
+							opRes:      OpResOk,
+							index:      msg.CommandIndex,
+							val:        kv.applyCommand(op),
+						}
+						kv.cacheTable.insert(op.ClientId, &opChan)
+					}
+				}
+				kv.lastApplied = msg.CommandIndex
+			}
+			kv.mu.Unlock()
+		}
+	}
+}
+func (kv *KVServer) applierOld(ch chan raft.ApplyMsg) {
 	for msg := range ch {
 		if !msg.SnapshotValid && !msg.CommandValid {
 			return
@@ -187,49 +301,13 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 							v.cond.L.Unlock()
 						}
 						if v.index < msg.CommandIndex && v.expectTerm > msg.CommandTerm {
-							panic("should appear in snapshot!!")
+							v.cond.L.Lock()
+							v.opRes = OpResFail
+							v.cond.Broadcast()
+							v.cond.L.Unlock()
 						}
 					}
 				}
-				//if opc, ok := kv.cacheTable.tryGetOpChan(op.ClientId); ok {
-				//	opc.cond.L.Lock()
-				//	if op.Type == GetLog {
-				//		if val, ok := kv.stateMachine[op.Key]; ok {
-				//			opc.val = val
-				//		} else {
-				//			opc.val = ""
-				//		}
-				//	}
-				//	if opc.opRes == OpUnknown {
-				//		if opc.expectTerm == term && opc.index == index {
-				//			opc.opRes = OpResOk
-				//		} else {
-				//			opc.opRes = OpResFail
-				//		}
-				//		opc.cond.Broadcast()
-				//	}
-				//	opc.cond.L.Unlock()
-				//}
-				//if opc, ok := kv.cacheTable.tryGetByIndex(index); ok {
-				//	opc.cond.L.Lock()
-				//	if op.Type == GetLog {
-				//		if val, ok := kv.stateMachine[op.Key]; ok {
-				//			opc.val = val
-				//		} else {
-				//			opc.val = ""
-				//		}
-				//	}
-				//	if opc.opRes == OpUnknown {
-				//		if opc.expectTerm == term {
-				//			opc.opRes = OpResOk
-				//		} else {
-				//			opc.opRes = OpResFail
-				//		}
-				//		opc.cond.Broadcast()
-				//	}
-				//	opc.cond.L.Unlock()
-				//}
-				//if opc, ok := kv.cacheTable.tryGetOpChan()
 			}
 			kv.mu.Unlock()
 		} else {
@@ -237,79 +315,22 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 		}
 	}
 }
-func (kv *KVServer) heartBeat() {
-	for !kv.killed() {
-		//kv.PutAppend(args.)
-		time.Sleep(time.Second)
-	}
-}
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	for {
-		kv.mu.Lock()
-		if kv.lastApplied >= args.MinIndex {
-			if m, ok := kv.stateMachine[args.Key]; ok {
-				reply.Err = OK
-				reply.Value = m
-			} else {
-				reply.Err = ErrNoKey
-				reply.Value = ""
-			}
-			reply.LastApplied = kv.lastApplied
-			kv.mu.Unlock()
-			break
-		} else {
-			DPrintf("[%v] kv.lastApplied = %v, MinIndex = %v\n", kv.me, kv.lastApplied, args.MinIndex)
-			var gw *GetWait
-			lck := sync.Mutex{}
-			ok := false
-			if gw, ok = kv.wTable[args.MinIndex]; !ok {
-				gw = &GetWait{
-					cond: sync.NewCond(&lck),
-					res:  "",
-					exit: false,
-					key:  args.Key,
-				}
-				kv.wTable[args.MinIndex] = gw
-			}
-			kv.mu.Unlock()
-			gw.cond.L.Lock()
-			for gw.finished == false {
-				gw.cond.Wait()
-			}
-			gw.cond.L.Unlock()
-			continue
-		}
-	}
-	return
-}
-func (kv *KVServer) GetFromLeader(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	// TODO: 思考，是否需要进行leader判断。还是进行majority获取
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	if _, isLeader := kv.rf.GetState(); !isLeader {
-		reply.Err = ErrWrongLeader
-		reply.Value = ""
-		return
-	}
-	if m, ok := kv.stateMachine[args.Key]; ok {
-		reply.Err = OK
-		reply.Value = m
-	} else {
-		reply.Err = ErrNoKey
-		reply.Value = ""
-	}
-	return
-}
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	noRes := kv.putNoneOp()
+	if noRes != OK {
+		reply.Err = noRes
+		return
+	}
+	DPrintf("[server %v] in PutAppend, noRes = %v\n", kv.me, noRes)
 	kv.mu.Lock()
 	op := Op{}
 	clientId := ClientId{ClerkId: args.ClerkId, NextCallIndex: args.NextCallIndex}
 	kv.cacheTable.clearByClientId(clientId.previousCallIndex())
-	//DPrintf("[%v] get a PutAppend req = %v\n", kv.me, args)
 	res, ok := kv.cacheTable.tryGetOpChan(clientId)
+	DPrintf("[server %v] res = %v\n", kv.me, res)
 	if ok == false {
+		DPrintf("[server %v] in PutAppend, first PutAppend\n", kv.me)
 		if args.Op == "Put" {
 			op.Type = PutOp
 		} else if args.Op == "Append" {
@@ -327,63 +348,40 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		index, term, isLeader := kv.rf.Start(op)
 
 		if !isLeader {
-			//DPrintf("[%v] this req is fresh new, however this server is not leader, just return reply\n", kv.me)
 			reply.Err = ErrWrongLeader
 			kv.mu.Unlock()
 			return
 		}
-
 		DPrintf("[%v][%v] this req %v is fresh new, and this server is a leader, try to start\n", kv.me, term, args)
 		opChan := OpChan{
-			cond:       sync.NewCond(&sync.Mutex{}),
+			cond:       utils.NewCond(&sync.Mutex{}),
 			expectTerm: term,
 			op:         op,
+			opRes:      OpUnknown,
 			index:      index,
+			val:        "",
 		}
 		DPrintf("[%v] opchan = %v\n", kv.me, opChan)
 		opChan.opRes = OpUnknown
 		kv.cacheTable.insert(clientId, &opChan)
-		kv.mu.Unlock()
-		opChan.cond.L.Lock()
-		DPrintf("[%v] success lock the cond lock\n", kv.me)
-		for opChan.opRes == OpUnknown {
-			opChan.cond.Wait()
-		}
-		if opChan.opRes == OpResFail {
-			reply.Err = ErrCommitFailed
-			reply.Value = opChan.val
-			DPrintf("[%v] in first fail apply key = %v, opchan = %v\n", kv.me, args.Key, opChan)
-		} else {
-			reply.Err = OK
-			reply.LogIndex = index
-			reply.Value = opChan.val
-			DPrintf("[%v] in first success apply key = %v, opchan = %v\n", kv.me, args.Key, opChan)
-		}
-		if _, isLeader := kv.rf.GetState(); !isLeader {
-			reply.Err = ErrWrongLeader
-		}
-		opChan.cond.L.Unlock()
-	} else {
-		kv.mu.Unlock()
-		res.cond.L.Lock()
-		for res.opRes == OpUnknown {
-			res.cond.Wait()
-		}
-		if res.opRes == OpResFail {
-			reply.Err = ErrCommitFailed
-			reply.Value = res.val
-			DPrintf("[%v] in dup apply key = %v, opchan = %v\n", kv.me, args.Key, res)
-		} else {
-			reply.Err = OK
-			reply.LogIndex = res.index
-			reply.Value = res.val
-			DPrintf("[%v] in dup success apply key = %v, opchan = %v\n", kv.me, args.Key, res)
-		}
-		if _, isLeader := kv.rf.GetState(); !isLeader {
-			reply.Err = ErrWrongLeader
-		}
-		res.cond.L.Unlock()
+		res = &opChan
 	}
+	kv.mu.Unlock()
+	res.cond.L.Lock()
+	if res.opRes == OpUnknown {
+		res.cond.WaitWithTimeout(time.Second)
+	}
+	if res.opRes == OpResFail || res.opRes == OpUnknown {
+		reply.Err = ErrCommitFailed
+		reply.Value = res.val
+		DPrintf("[%v] in dup apply key = %v, opchan = %v\n", kv.me, args.Key, res)
+	} else {
+		reply.Err = OK
+		reply.LogIndex = res.index
+		reply.Value = res.val
+		DPrintf("[%v] in dup success apply key = %v, opchan = %v\n", kv.me, args.Key, res)
+	}
+	res.cond.L.Unlock()
 }
 func (kv *KVServer) Ack(args *AckArgs, reply *AckReply) {
 	kv.mu.Lock()
@@ -413,6 +411,24 @@ func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
 }
+
+//func (kv *KVServer) statusChecker() {
+//	term, _ := kv.rf.GetState()
+//	for !kv.killed() {
+//		time.Sleep(time.Millisecond * 500)
+//		nTerm, nIsLeader := kv.rf.GetState()
+//		if nTerm > term && nIsLeader {
+//			// no_op log into raft
+//			kv.rf.Start(Op{
+//				Type:     NoneOp,
+//				Key:      "",
+//				Args:     "",
+//				ClientId: ClientId{},
+//			})
+//		}
+//		term = nTerm
+//	}
+//}
 
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to

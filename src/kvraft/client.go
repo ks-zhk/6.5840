@@ -16,7 +16,7 @@ type Clerk struct {
 	// leader缓存，减少rpc的调用。
 	nowLeader     int
 	clerkId       int
-	nextCallIndex bool // 0 or 1
+	nextCallIndex int // 0 or 1
 	//latestIndex   int
 }
 type RespIndex struct {
@@ -25,7 +25,7 @@ type RespIndex struct {
 
 // 为了简单实现，这里就用全局变量了。
 // 如果需要更强的通用性以及安全性，可以考虑向server进行注册。
-var nextIndex int = 0
+var nextIndex int = 1
 var nmu sync.Mutex = sync.Mutex{}
 
 func nrand() int64 {
@@ -39,10 +39,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.nowLeader = 0 //假设0成为了leader
-	ck.nextCallIndex = false
+	ck.nextCallIndex = 0
 	nmu.Lock()
-	ck.clerkId = nextIndex
 	nextIndex += 1
+	ck.clerkId = nextIndex
 	nmu.Unlock()
 	//go ck.heartBeat()
 	// You'll have to add code here.
@@ -171,59 +171,60 @@ func (ck *Clerk) GetOld(key string) string {
 	// You will have to modify this function.
 	return ""
 }
-func (ck *Clerk) PutAppendSpecificServer(sid int, mu *sync.Mutex, finished *bool, key string, value string, op string, callIndex bool, wg *sync.WaitGroup, ch chan int, val *string) {
-	args := PutAppendArgs{
-		Key:           key,
-		Value:         value,
-		Op:            op,
-		ClerkId:       ck.clerkId,
-		NextCallIndex: callIndex,
-	}
-	server := ck.servers[sid]
-	reply := PutAppendReply{}
-	res := false
-	for {
-		res = false
-		for res == false {
-			mu.Lock()
-			if *finished {
-				mu.Unlock()
-				wg.Done()
-				ch <- sid
-				return
-			}
-			mu.Unlock()
-			reply = PutAppendReply{}
-			res = server.Call("KVServer.PutAppend", &args, &reply)
-		}
-		if reply.Err == ErrCommitFailed {
-			wg.Done()
-			ch <- sid
-			return
-		}
-		if reply.Err == ErrWrongLeader {
-			wg.Done()
-			ch <- sid
-			return
-		}
-		if reply.Err == ErrNoSupportOp || reply.Err == ErrNoKey {
-			panic("stale error")
-		}
-		if reply.Err == OK {
-			mu.Lock()
-			if *finished {
-				panic("multi leader!")
-				return
-			}
-			*finished = true
-			*val = reply.Value
-			mu.Unlock()
-			wg.Done()
-			ch <- sid
-			return
-		}
-	}
-}
+
+//func (ck *Clerk) PutAppendSpecificServer(sid int, mu *sync.Mutex, finished *bool, key string, value string, op string, callIndex bool, wg *sync.WaitGroup, ch chan int, val *string) {
+//	args := PutAppendArgs{
+//		Key:           key,
+//		Value:         value,
+//		Op:            op,
+//		ClerkId:       ck.clerkId,
+//		NextCallIndex: callIndex,
+//	}
+//	server := ck.servers[sid]
+//	reply := PutAppendReply{}
+//	res := false
+//	for {
+//		res = false
+//		for res == false {
+//			mu.Lock()
+//			if *finished {
+//				mu.Unlock()
+//				wg.Done()
+//				ch <- sid
+//				return
+//			}
+//			mu.Unlock()
+//			reply = PutAppendReply{}
+//			res = server.Call("KVServer.PutAppend", &args, &reply)
+//		}
+//		if reply.Err == ErrCommitFailed {
+//			wg.Done()
+//			ch <- sid
+//			return
+//		}
+//		if reply.Err == ErrWrongLeader {
+//			wg.Done()
+//			ch <- sid
+//			return
+//		}
+//		if reply.Err == ErrNoSupportOp || reply.Err == ErrNoKey {
+//			panic("stale error")
+//		}
+//		if reply.Err == OK {
+//			mu.Lock()
+//			if *finished {
+//				panic("multi leader!")
+//				return
+//			}
+//			*finished = true
+//			*val = reply.Value
+//			mu.Unlock()
+//			wg.Done()
+//			ch <- sid
+//			return
+//		}
+//	}
+//}
 func (ck *Clerk) heartBeat() {
 	for {
 		time.Sleep(time.Second)
@@ -231,32 +232,55 @@ func (ck *Clerk) heartBeat() {
 	}
 }
 func (ck *Clerk) PutAppend(key string, value string, op string, res *string) {
-	ck.nextCallIndex = !ck.nextCallIndex
-	wg := sync.WaitGroup{}
-	ch := make(chan int, len(ck.servers))
-	finished := false
-	mu := sync.Mutex{}
-	//for finished == false {
-	//	finished = false
-	for i, _ := range ck.servers {
-		wg.Add(1)
-		//DPrintf("")
-		go ck.PutAppendSpecificServer(i, &mu, &finished, key, value, op, ck.nextCallIndex, &wg, ch, res)
+	ck.nextCallIndex = ck.nextCallIndex + 1
+	args := PutAppendArgs{
+		Key:           key,
+		Value:         value,
+		Op:            op,
+		ClerkId:       ck.clerkId,
+		NextCallIndex: ck.nextCallIndex,
 	}
-	for {
-		sid := <-ch
-		mu.Lock()
-		if finished {
-			mu.Unlock()
-			break
+	reply := PutAppendReply{}
+	for i := ck.nowLeader; i < len(ck.servers); i = (i + 1) % len(ck.servers) {
+		DPrintf("try new leader\n")
+		reply = PutAppendReply{}
+		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrCommitFailed {
+			continue
 		}
-		mu.Unlock()
-		wg.Add(1)
-		go ck.PutAppendSpecificServer(sid, &mu, &finished, key, value, op, ck.nextCallIndex, &wg, ch, res)
+		*res = reply.Value
+		ck.nowLeader = i
+		break
 	}
-	wg.Wait()
-	//}
 }
+
+//func (ck *Clerk) PutAppendOld(key string, value string, op string, res *string) {
+//	ck.nextCallIndex = !ck.nextCallIndex
+//	wg := sync.WaitGroup{}
+//	ch := make(chan int, len(ck.servers))
+//	finished := false
+//	mu := sync.Mutex{}
+//	//for finished == false {
+//	//	finished = false
+//	for i, _ := range ck.servers {
+//		wg.Add(1)
+//		//DPrintf("")
+//		go ck.PutAppendSpecificServer(i, &mu, &finished, key, value, op, ck.nextCallIndex, &wg, ch, res)
+//	}
+//	for {
+//		sid := <-ch
+//		mu.Lock()
+//		if finished {
+//			mu.Unlock()
+//			break
+//		}
+//		mu.Unlock()
+//		wg.Add(1)
+//		go ck.PutAppendSpecificServer(sid, &mu, &finished, key, value, op, ck.nextCallIndex, &wg, ch, res)
+//	}
+//	wg.Wait()
+//	//}
+//}
 
 // shared by Put and Append.
 //
@@ -266,43 +290,43 @@ func (ck *Clerk) PutAppend(key string, value string, op string, res *string) {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-func (ck *Clerk) PutAppendOld(key string, value string, op string) {
-	// You will have to modify this function.
-	ck.nextCallIndex = !ck.nextCallIndex
-	args := PutAppendArgs{
-		Key:           key,
-		Value:         value,
-		Op:            op,
-		ClerkId:       ck.clerkId,
-		NextCallIndex: ck.nextCallIndex,
-	}
-	reply := PutAppendReply{}
-	res := false
-	// check a leader
-	for {
-		res = false
-		for res == false {
-			reply = PutAppendReply{}
-			res = ck.servers[ck.nowLeader].Call("KVServer.PutAppend", &args, &reply)
-		}
-		DPrintf("[%v] get a reply = %v\n", ck.clerkId, reply)
-		for reply.Err == ErrWrongLeader {
-			ck.nowLeader = (ck.nowLeader + 1) % len(ck.servers)
-			res = false
-			for res == false {
-				reply = PutAppendReply{}
-				res = ck.servers[ck.nowLeader].Call("KVServer.PutAppend", &args, &reply)
-			}
-		}
-		if reply.Err == ErrCommitFailed {
-			continue
-		}
-		if reply.Err == ErrNoSupportOp {
-			panic("not support op")
-		}
-		break
-	}
-}
+//func (ck *Clerk) PutAppendOldOld(key string, value string, op string) {
+//	// You will have to modify this function.
+//	ck.nextCallIndex = !ck.nextCallIndex
+//	args := PutAppendArgs{
+//		Key:           key,
+//		Value:         value,
+//		Op:            op,
+//		ClerkId:       ck.clerkId,
+//		NextCallIndex: ck.nextCallIndex,
+//	}
+//	reply := PutAppendReply{}
+//	res := false
+//	// check a leader
+//	for {
+//		res = false
+//		for res == false {
+//			reply = PutAppendReply{}
+//			res = ck.servers[ck.nowLeader].Call("KVServer.PutAppend", &args, &reply)
+//		}
+//		DPrintf("[%v] get a reply = %v\n", ck.clerkId, reply)
+//		for reply.Err == ErrWrongLeader {
+//			ck.nowLeader = (ck.nowLeader + 1) % len(ck.servers)
+//			res = false
+//			for res == false {
+//				reply = PutAppendReply{}
+//				res = ck.servers[ck.nowLeader].Call("KVServer.PutAppend", &args, &reply)
+//			}
+//		}
+//		if reply.Err == ErrCommitFailed {
+//			continue
+//		}
+//		if reply.Err == ErrNoSupportOp {
+//			panic("not support op")
+//		}
+//		break
+//	}
+//}
 func (ck *Clerk) Put(key string, value string) {
 	res := ""
 	DPrintf("[c %v] try to Put key = %v, value = %v\n", ck.clerkId, key, value)
