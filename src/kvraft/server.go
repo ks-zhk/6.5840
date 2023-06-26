@@ -130,6 +130,8 @@ type KVServer struct {
 	snapshot          []byte
 	snapshotLastIndex int
 	wTable            map[int]*GetWait // Get的等待表
+	lastTerm          int
+	persister         *raft.Persister
 }
 
 func (kv *KVServer) applyCommand(op Op) string {
@@ -160,6 +162,11 @@ func (kv *KVServer) applyCommand(op Op) string {
 // put a no-op into this server, to update the commit to the latest, for updating the server.cacheTable to the latest
 func (kv *KVServer) putNoneOp() Err {
 	kv.mu.Lock()
+	//nTerm, nIsLeader := kv.rf.GetState()
+	//if !(nTerm > kv.lastTerm && nIsLeader) {
+	//	// 仅成为leader才会进行操作
+	//	return OK
+	//}
 	DPrintf("[server %v] in putNoneOp\n", kv.me)
 	clientId := ClientId{
 		ClerkId:       0, // not exit clientId
@@ -201,6 +208,63 @@ func (kv *KVServer) putNoneOp() Err {
 	opChan.cond.L.Unlock()
 	return err
 }
+func (kv *KVServer) applierSnapshot(ch chan raft.ApplyMsg) {
+	for msg := range ch {
+		if kv.killed() {
+			return
+		}
+		if msg.CommandValid {
+			kv.mu.Lock()
+			if op, ok := msg.Command.(Op); ok && msg.CommandIndex > kv.lastApplied {
+				if opChan, ok := kv.cacheTable.tryGetOpChan(op.ClientId); ok {
+					opChan.cond.L.Lock()
+					//if opChan.opRes == OpResOk && op.Type != NoneOp {
+					//	DPrintf("[s %v] duplicate apply OpResOk command = %v\n", kv.me, opChan)
+					//	panic("")
+					//}
+					if opChan.opRes == OpUnknown {
+						opChan.opRes = OpResOk
+						opChan.val = kv.applyCommand(op)
+					}
+					opChan.cond.Broadcast()
+					opChan.cond.L.Unlock()
+				} else {
+					// 添加一下这一步非常关键。但是呢，返回只是它commit了，不代表server也commit了，
+					// 这只能防止一部分情况
+					// 还需要添加额外的限制来进行防止。
+					// 如何解决这个问题 client_request -> hit leader, start, success replicate, commit -> reply error -> become follower,
+					// client_request -> hit new leader, -> .....
+					// 解决方案：在每次append之前，判断当前server是否进行了部分转换，如果进行了转换，则现进行一次None-op的append，用于将该server中的所有log进行一次commit
+					// 最逆天的解决方案：每次append之前，都直接put一个空操作。
+					// 驱使下方代码的执行！。完美解决了兄弟们。
+					if op.Type != NoneOp {
+						opChan := OpChan{
+							expectTerm: msg.CommandTerm,
+							op:         op,
+							cond:       utils.NewCond(&deadlock.Mutex{}),
+							opRes:      OpResOk,
+							index:      msg.CommandIndex,
+							val:        kv.applyCommand(op),
+						}
+						kv.cacheTable.insert(op.ClientId, &opChan)
+					}
+				}
+				kv.lastApplied = msg.CommandIndex
+				if len(kv.persister.ReadRaftState()) >= kv.maxraftstate*10/11 {
+					// 制作snapshot
+
+				}
+				//if len(kv.persister.ReadRaftState()) >= kv.maxraftstate* {
+				//	// 准备制作snapshot
+				//
+				//}
+			}
+			kv.mu.Unlock()
+		} else {
+
+		}
+	}
+}
 func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 	for msg := range ch {
 		if kv.killed() {
@@ -210,15 +274,12 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 			kv.mu.Lock()
 			if op, ok := msg.Command.(Op); ok && msg.CommandIndex > kv.lastApplied {
 				if opChan, ok := kv.cacheTable.tryGetOpChan(op.ClientId); ok {
-					val := kv.applyCommand(op)
 					opChan.cond.L.Lock()
-					opChan.val = val
 					if opChan.opRes == OpUnknown {
-						if opChan.index == msg.CommandIndex && opChan.expectTerm == msg.CommandTerm {
-							opChan.opRes = OpResOk
-						} else {
-							opChan.opRes = OpResFail
-						}
+						opChan.index = msg.CommandIndex
+						opChan.expectTerm = msg.CommandTerm
+						opChan.opRes = OpResOk
+						opChan.val = kv.applyCommand(op)
 					}
 					opChan.cond.Broadcast()
 					opChan.cond.L.Unlock()
@@ -256,13 +317,11 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 //
 //}
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
 	noRes := kv.putNoneOp()
 	if noRes != OK {
 		reply.Err = noRes
 		return
 	}
-	// 在这个瞬间，复制过来了。那也太逆天了吧，这该如何是好啊。
 	DPrintf("[server %v] in PutAppend, noRes = %v\n", kv.me, noRes)
 	kv.mu.Lock()
 	op := Op{}
@@ -270,7 +329,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.cacheTable.clearByClientId(clientId.previousCallIndex())
 	res, ok := kv.cacheTable.tryGetOpChan(clientId)
 	DPrintf("[server %v] res = %v\n", kv.me, res)
-	if ok == false || (kv.lastApplied > res.index && (res.getOpResWithLock() == OpUnknown || res.getOpResWithLock() == OpResFail)) {
+	if ok == false || (kv.lastApplied > res.index && res.opRes == OpUnknown) {
 		DPrintf("[server %v] in PutAppend, first PutAppend\n", kv.me)
 		if args.Op == "Put" {
 			op.Type = PutOp
@@ -353,23 +412,23 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-//func (kv *KVServer) statusChecker() {
-//	term, _ := kv.rf.GetState()
-//	for !kv.killed() {
-//		time.Sleep(time.Millisecond * 500)
-//		nTerm, nIsLeader := kv.rf.GetState()
-//		if nTerm > term && nIsLeader {
-//			// no_op log into raft
-//			kv.rf.Start(Op{
-//				Type:     NoneOp,
-//				Key:      "",
-//				Args:     "",
-//				ClientId: ClientId{},
-//			})
-//		}
-//		term = nTerm
-//	}
-//}
+func (kv *KVServer) statusChecker() {
+	term, _ := kv.rf.GetState()
+	for !kv.killed() {
+		time.Sleep(time.Millisecond * 500)
+		nTerm, nIsLeader := kv.rf.GetState()
+		if nTerm > term && nIsLeader {
+			// no_op log into raft
+			kv.rf.Start(Op{
+				Type:     NoneOp,
+				Key:      "",
+				Args:     "",
+				ClientId: ClientId{},
+			})
+		}
+		term = nTerm
+	}
+}
 
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -393,7 +452,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	defer kv.mu.Unlock()
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
+	kv.persister = persister
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -407,7 +466,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastApplied = kv.snapshotLastIndex
 	kv.stateMachine = make(map[string]string)
 	kv.dead = 0
+	kv.lastTerm = 0
 	go kv.applier(kv.applyCh)
+	//go kv.statusChecker()
 	// You may need initialization code here.
 
 	return kv
