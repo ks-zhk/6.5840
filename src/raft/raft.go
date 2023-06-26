@@ -21,6 +21,7 @@ import (
 	"6.5840/labgob"
 	"bytes"
 	"errors"
+	"github.com/sasha-s/go-deadlock"
 	"log"
 	"math/rand"
 	"sync"
@@ -64,7 +65,7 @@ const MAX_LOG_NUM = 1999
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state, 暂时是一把大锁保平安
+	mu        deadlock.Mutex      // Lock to protect shared access to this peer's state, 暂时是一把大锁保平安
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -228,7 +229,7 @@ func (rf *Raft) lockWithCheckForLeader(term int) bool {
 // idx ok
 func (rf *Raft) convertToLeaderConfigNoneLock() {
 	DPrintf("[%v][%v][%v] become leader\n", rf.me, rf.term, rf.snapshotLastIndex)
-	log.Printf("[%v][%v][%v] become leader\n", rf.me, rf.term, rf.snapshotLastIndex)
+	//log.Printf("[%v][%v][%v] become leader\n", rf.me, rf.term, rf.snapshotLastIndex)
 	for i := 0; i < len(rf.peers); i++ {
 		if len(rf.logs) == 0 {
 			rf.nextIndex[i] = rf.snapshotLastIndex + 1
@@ -329,7 +330,7 @@ func (rf *Raft) becomeCandidateNoneLock() {
 	DPrintf("[%v][%v][%v] try to persist in becomeCandidateNoneLock\n", rf.me, rf.term, rf.snapshotLastIndex)
 	rf.persistNoneLock()
 	DPrintf("[%v][%v][%v] become candidate\n", rf.me, rf.term, rf.snapshotLastIndex)
-	log.Printf("[%v][%v][%v] become candidate\n", rf.me, rf.term, rf.snapshotLastIndex)
+	//log.Printf("[%v][%v][%v] become candidate\n", rf.me, rf.term, rf.snapshotLastIndex)
 }
 
 // save Raft's persistent state to stable storage,
@@ -704,7 +705,7 @@ func (rf *Raft) AppendEntriesNew(args *RequestAppendEntries, reply *ReplyAppendE
 
 func (rf *Raft) convertToFollowerNoneLock(newTerm int) {
 	DPrintf("[%v][%v][%v] become follower with new term %v\n", rf.me, rf.term, rf.snapshotLastIndex, newTerm)
-	log.Printf("[%v][%v][%v] become follower with new term %v\n", rf.me, rf.term, rf.snapshotLastIndex, newTerm)
+	//log.Printf("[%v][%v][%v] become follower with new term %v\n", rf.me, rf.term, rf.snapshotLastIndex, newTerm)
 	rf.term = newTerm
 	rf.state = Follower
 	rf.hasVoted = false
@@ -1375,6 +1376,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteGet = 0
 	go rf.ticker()
 	go rf.applier(rf.snapshotLastIndex)
-	go rf.debugTermLoop()
+	//go rf.debugTermLoop()
 	return rf
 }

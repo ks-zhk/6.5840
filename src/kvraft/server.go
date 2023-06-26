@@ -5,6 +5,7 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raft"
 	"6.5840/utils"
+	"github.com/sasha-s/go-deadlock"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -64,6 +65,12 @@ type OpChan struct {
 	val        string
 }
 
+func (ch *OpChan) getOpResWithLock() OpRes {
+	ch.cond.L.Lock()
+	defer ch.cond.L.Unlock()
+	return ch.opRes
+}
+
 // 错误处理应该指导分支，而不是直接退出
 // 不应该侵占任何其他逻辑，做好本分的增删改查即可
 type CacheTable struct {
@@ -108,7 +115,7 @@ type GetWait struct {
 	finished bool
 }
 type KVServer struct {
-	mu      sync.Mutex
+	mu      deadlock.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
@@ -171,7 +178,7 @@ func (kv *KVServer) putNoneOp() Err {
 	}
 	DPrintf("[server %v] wait for PutNoneOp Success\n", kv.me)
 	opChan := &OpChan{
-		cond:       utils.NewCond(&sync.Mutex{}),
+		cond:       utils.NewCond(&deadlock.Mutex{}),
 		expectTerm: term,
 		op:         op,
 		opRes:      OpUnknown,
@@ -228,7 +235,7 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 						opChan := OpChan{
 							expectTerm: msg.CommandTerm,
 							op:         op,
-							cond:       utils.NewCond(&sync.Mutex{}),
+							cond:       utils.NewCond(&deadlock.Mutex{}),
 							opRes:      OpResOk,
 							index:      msg.CommandIndex,
 							val:        kv.applyCommand(op),
@@ -242,79 +249,12 @@ func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
 		}
 	}
 }
-func (kv *KVServer) applierOld(ch chan raft.ApplyMsg) {
-	for msg := range ch {
-		if !msg.SnapshotValid && !msg.CommandValid {
-			return
-		}
-		//DPrintf("[s %v] get a commit %v\n", kv.me, msg)
-		if msg.CommandValid {
-			kv.mu.Lock()
-			index := msg.CommandIndex
-			term := msg.CommandTerm
-			if op, ok := msg.Command.(Op); ok {
-				DPrintf("[s %v] get a command apply, command = %v\n", kv.me, msg)
-				if msg.CommandIndex > kv.lastApplied {
-					if op.Type == AppendOp {
-						if m, ok := kv.stateMachine[op.Key]; ok {
-							m += op.Args
-							kv.stateMachine[op.Key] = m
-						} else {
-							kv.stateMachine[op.Key] = op.Args
-						}
-					}
-					if op.Type == PutOp {
-						kv.stateMachine[op.Key] = op.Args
-					}
-					kv.lastApplied = msg.CommandIndex
-				}
-				for _, v := range kv.cacheTable.dupTable {
-					if v.index == msg.CommandIndex && v.expectTerm == msg.CommandTerm {
-						v.cond.L.Lock()
-						if op.Type == GetLog {
-							if val, ok := kv.stateMachine[op.Key]; ok {
-								v.val = val
-							} else {
-								v.val = ""
-							}
-						}
-						if v.opRes == OpUnknown {
-							if v.expectTerm == term && v.index == index {
-								v.opRes = OpResOk
-							} else {
-								v.opRes = OpResFail
-							}
-							v.cond.Broadcast()
-						}
-						v.cond.L.Unlock()
-					} else if v.index == msg.CommandIndex && v.expectTerm != msg.CommandTerm {
-						v.cond.L.Lock()
-						v.opRes = OpResFail
-						v.cond.Broadcast()
-						v.cond.L.Unlock()
-					} else {
-						if v.index > msg.CommandIndex && v.expectTerm < msg.CommandTerm {
-							// FAIL
-							v.cond.L.Lock()
-							v.opRes = OpResFail
-							v.cond.Broadcast()
-							v.cond.L.Unlock()
-						}
-						if v.index < msg.CommandIndex && v.expectTerm > msg.CommandTerm {
-							v.cond.L.Lock()
-							v.opRes = OpResFail
-							v.cond.Broadcast()
-							v.cond.L.Unlock()
-						}
-					}
-				}
-			}
-			kv.mu.Unlock()
-		} else {
-			// TODO: 等待实现snapshot的形式
-		}
-	}
-}
+
+//func (kv *KVServer) checkOpNoneLock(ch *OpChan) {
+//	ch.cond.L.Lock()
+//	defer ch.cond.L.Unlock()
+//
+//}
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	noRes := kv.putNoneOp()
@@ -322,6 +262,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = noRes
 		return
 	}
+	// 在这个瞬间，复制过来了。那也太逆天了吧，这该如何是好啊。
 	DPrintf("[server %v] in PutAppend, noRes = %v\n", kv.me, noRes)
 	kv.mu.Lock()
 	op := Op{}
@@ -329,7 +270,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.cacheTable.clearByClientId(clientId.previousCallIndex())
 	res, ok := kv.cacheTable.tryGetOpChan(clientId)
 	DPrintf("[server %v] res = %v\n", kv.me, res)
-	if ok == false {
+	if ok == false || (kv.lastApplied > res.index && (res.getOpResWithLock() == OpUnknown || res.getOpResWithLock() == OpResFail)) {
 		DPrintf("[server %v] in PutAppend, first PutAppend\n", kv.me)
 		if args.Op == "Put" {
 			op.Type = PutOp
@@ -354,7 +295,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 		DPrintf("[%v][%v] this req %v is fresh new, and this server is a leader, try to start\n", kv.me, term, args)
 		opChan := OpChan{
-			cond:       utils.NewCond(&sync.Mutex{}),
+			cond:       utils.NewCond(&deadlock.Mutex{}),
 			expectTerm: term,
 			op:         op,
 			opRes:      OpUnknown,
@@ -400,10 +341,10 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
-	kv.applyCh <- raft.ApplyMsg{
-		CommandValid:  false,
-		SnapshotValid: false,
-	}
+	//kv.applyCh <- raft.ApplyMsg{
+	//	CommandValid:  false,
+	//	SnapshotValid: false,
+	//}
 
 }
 
