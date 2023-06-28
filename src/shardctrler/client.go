@@ -9,9 +9,13 @@ import "time"
 import "crypto/rand"
 import "math/big"
 
+var ClerkNextId int = 1
+
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	id           int
+	nextOpsIndex int
 }
 
 func nrand() int64 {
