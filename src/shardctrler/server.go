@@ -275,7 +275,7 @@ func (sc *ShardCtrler) checkSum() {
 		}
 	}
 }
-func (sc *ShardCtrler) applyOp(op Op) {
+func (sc *ShardCtrler) applyOp(op Op) (Config, Err) {
 	chgs := []ShardChangeLog{}
 	switch op.Type {
 	case JoinT:
@@ -332,9 +332,16 @@ func (sc *ShardCtrler) applyOp(op Op) {
 		}
 	case QueryT:
 		{
-
+			args := op.Args.(QueryArgs)
+			num := args.Num
+			if args.Num == -1 || args.Num > sc.cfgNum {
+				num = sc.cfgNum
+			}
+			cfg := sc.configs[num]
+			return cfg, OK
 		}
 	}
+	return sc.configs[sc.cfgNum], OK
 }
 func (sc *ShardCtrler) applier() {
 	for msg := range sc.applyCh {
