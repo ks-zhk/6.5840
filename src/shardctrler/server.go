@@ -3,8 +3,10 @@ package shardctrler
 import (
 	"6.5840/raft"
 	"6.5840/utils"
+	"log"
 	"math"
 	"sync/atomic"
+	"time"
 )
 import "6.5840/labrpc"
 import "sync"
@@ -23,12 +25,20 @@ type ShardCtrler struct {
 	cfgNum  int
 	//gInfo            btree.BTree
 	gidMapShardNum   map[int]int
-	clientLastIndex  []int
+	clientLastIndex  map[int]int
+	queryNumHistory  map[ClientId]int
 	lastAppliedIndex int
 	dupTable         CacheTable
 }
 
-var debugMode bool = true
+const debugMode bool = true
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if debugMode {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 type GInfo struct {
 	gid      int
@@ -122,7 +132,7 @@ type ShardChangeLog struct {
 	ShardNum    int
 }
 
-func (sc *ShardCtrler) balance() []ShardChangeLog {
+func (sc *ShardCtrler) balance(expect []int) []ShardChangeLog {
 	chgs := []ShardChangeLog{}
 	var maxGid int = math.MaxInt
 	var maxV int = -1
@@ -132,6 +142,9 @@ func (sc *ShardCtrler) balance() []ShardChangeLog {
 		find := false
 		// init
 		for gid, sd := range sc.gidMapShardNum {
+			if intExitInArray(gid, expect) {
+				continue
+			}
 			maxGid = gid
 			maxV = sd
 			minGid = gid
@@ -140,16 +153,21 @@ func (sc *ShardCtrler) balance() []ShardChangeLog {
 			break
 		}
 		// find max and int
+		DPrintf("[sc %v] gidMapShardNum = %v\n", sc.me, sc.gidMapShardNum)
 		for gid, sd := range sc.gidMapShardNum {
-			if sd >= maxV && gid < maxGid {
+			if intExitInArray(gid, expect) {
+				continue
+			}
+			if (sd == maxV && gid < maxGid) || sd > maxV {
 				maxGid = gid
 				maxV = sd
 			}
-			if sd <= minV && gid > minGid {
+			if (sd == minV && gid > minGid) || sd < minV {
 				minGid = gid
 				minV = sd
 			}
 		}
+		DPrintf("[sc %v] find = %v, maxGid = %v, maxV = %v, minGid = %v, minV = %v\n", sc.me, find, maxGid, maxV, minGid, minV)
 		if !find || maxV-minV <= 1 {
 			break
 		}
@@ -174,11 +192,13 @@ func (sc *ShardCtrler) balance() []ShardChangeLog {
 				break
 			}
 		}
+		sc.checkSum()
 	}
+	sc.checkBalance()
 	return chgs
 }
 func intExitInArray(ele int, arr []int) bool {
-	for el := range arr {
+	for _, el := range arr {
 		if el == ele {
 			return true
 		}
@@ -187,10 +207,11 @@ func intExitInArray(ele int, arr []int) bool {
 }
 func (sc *ShardCtrler) reassign(gidRs []int, shards []int) []ShardChangeLog {
 	// 贪心，每次选出最小值，分给他。
+	DPrintf("[sc %v] ready to reassign, gidRs = %v, shards = %v\n", sc.me, gidRs, shards)
 	chgs := []ShardChangeLog{}
 	var minV int
 	var minGid int
-	for shard := range shards {
+	for _, shard := range shards {
 		// step1: find min
 		find := false
 		for gid, sd := range sc.gidMapShardNum {
@@ -205,11 +226,12 @@ func (sc *ShardCtrler) reassign(gidRs []int, shards []int) []ShardChangeLog {
 			break
 		}
 		for gid, sd := range sc.gidMapShardNum {
-			if sd <= minV && gid > minGid && !intExitInArray(gid, gidRs) {
+			if ((sd == minV && gid > minGid) || sd < minV) && !intExitInArray(gid, gidRs) {
 				minV = sd
 				minGid = gid
 			}
 		}
+		DPrintf("[sc %v] in reassign, find = %v, minV = %v, minGid = %v\n", sc.me, find, minV, minGid)
 		sc.gidMapShardNum[minGid] += 1
 		if sc.gidMapShardNum[minGid] > NShards {
 			panic("gidMapShardNum[targetGid] can not above NShard")
@@ -217,6 +239,7 @@ func (sc *ShardCtrler) reassign(gidRs []int, shards []int) []ShardChangeLog {
 		// step2: replace the target shard to chose gid
 		gidR := sc.configs[sc.cfgNum].Shards[shard]
 		sc.configs[sc.cfgNum].Shards[shard] = minGid
+		//DPrintf("[sc %v] shard [%v] change to %v\n", sc.me, shards minGid)
 		chgs = append(chgs, ShardChangeLog{
 			FromGid:     gidR,
 			FromServers: sc.configs[sc.cfgNum].Groups[gidR],
@@ -228,11 +251,15 @@ func (sc *ShardCtrler) reassign(gidRs []int, shards []int) []ShardChangeLog {
 		if sc.gidMapShardNum[gidR] < 0 {
 			panic("gidMapShardNum[gidR] can not below zero")
 		}
+		sc.checkSum()
 	}
+	DPrintf("[sc %v] after reassign, config = %v\n", sc.me, sc.configs[sc.cfgNum].Shards)
+	//sc.checkBalance()
 	return chgs
 }
 func (sc *ShardCtrler) cfgNumPlusOneAndCopy() {
 	sc.cfgNum += 1
+	sc.configs = append(sc.configs, Config{})
 	sc.configs[sc.cfgNum] = Config{
 		Num:    sc.cfgNum,
 		Shards: [NShards]int{},
@@ -247,8 +274,10 @@ func (sc *ShardCtrler) cfgNumPlusOneAndCopy() {
 }
 func (sc *ShardCtrler) gidsToShards(gids []int) []int {
 	res := []int{}
-	for gidr := range gids {
+	//DPrintf("[sc %v] now configs's shards = %v\n", sc.me, sc.configs[sc.cfgNum].Shards)
+	for _, gidr := range gids {
 		for shard, gid := range sc.configs[sc.cfgNum].Shards {
+			//DPrintf("[sc %v] gid = %v, gidr = %v\n", sc.me, gid, gidr)
 			if gid == gidr {
 				res = append(res, shard)
 			}
@@ -271,44 +300,89 @@ func (sc *ShardCtrler) checkSum() {
 			}
 		}
 		if realShardNum != shardNum {
+			DPrintf("[sc %v] gidT = %v, realShardNum = %v, shardNum = %v\n", sc.me, gidt, realShardNum, shardNum)
 			panic("check sum failed")
 		}
 	}
 }
-func (sc *ShardCtrler) applyOp(op Op) (Config, Err) {
+func (sc *ShardCtrler) checkBalance() {
+	var minV int
+	var maxV int
+	find := false
+	for gid, sd := range sc.gidMapShardNum {
+		if gid == 0 {
+			continue
+		}
+		minV = sd
+		maxV = sd
+		find = true
+		break
+	}
+	if !find {
+		return
+	}
+	for gid, sd := range sc.gidMapShardNum {
+		if gid == 0 {
+			continue
+		}
+		if sd > maxV {
+			maxV = sd
+		}
+		if sd < minV {
+			minV = sd
+		}
+		break
+	}
+	if maxV > minV+1 {
+		DPrintf("[sc %v] sc.gidMapShardNum = %v, max = %v, min = %v\n", sc.me, sc.gidMapShardNum, maxV, minV)
+		panic("check balance failed")
+	}
+}
+func (sc *ShardCtrler) applyOp(op Op) Config {
 	chgs := []ShardChangeLog{}
+	defer sc.checkSum()
 	switch op.Type {
 	case JoinT:
 		{
+			DPrintf("[sc %v] prepare Join\n", sc.me)
 			args := op.Args.(JoinArgs)
 			sc.cfgNumPlusOneAndCopy()
 			for gid, server := range args.Servers {
 				sc.configs[sc.cfgNum].Groups[gid] = server
 				sc.gidMapShardNum[gid] = 0
 			}
-			chgs = append(chgs, sc.reassign([]int{-1}, sc.gidsToShards([]int{-1}))...)
-			chgs = append(chgs, sc.balance()...)
+			chgs = append(chgs, sc.reassign([]int{0}, sc.gidsToShards([]int{0}))...)
+			chgs = append(chgs, sc.balance([]int{0})...)
+			sc.checkSum()
 			sc.solveChanges(chgs, true)
 		}
 	case LeaveT:
 		{
 			args := op.Args.(LeaveArgs)
+			args.GIDs = append(args.GIDs, 0)
 			sc.cfgNumPlusOneAndCopy()
+			DPrintf("[sc %v] try to leave %v, shards = %v\n", sc.me, args.GIDs, sc.gidsToShards(args.GIDs))
 			chgs = sc.reassign(args.GIDs, sc.gidsToShards(args.GIDs))
-			for gid := range args.GIDs {
+			for _, gid := range args.GIDs {
 				delete(sc.gidMapShardNum, gid)
 				delete(sc.configs[sc.cfgNum].Groups, gid)
 			}
+			DPrintf("[sc %v] sc.gidMapShardNum = %v\n", sc.me, sc.gidMapShardNum)
 			// 查询分配失败的shard, 将其设置野shard
 			for shard, gid := range sc.configs[sc.cfgNum].Shards {
 				if intExitInArray(gid, args.GIDs) {
-					sc.configs[sc.cfgNum].Shards[shard] = -1
+					DPrintf("[sc %v] in fail gid = %v\n", sc.me, gid)
+					sc.configs[sc.cfgNum].Shards[shard] = 0
+					sc.gidMapShardNum[0] += 1
 				}
 			}
+			sc.checkSum()
+			sc.checkBalance()
 			sc.solveChanges(chgs, false)
 		}
 	case MoveT:
 		{
+			// no balance ops
 			args := op.Args.(MoveArgs)
 			sc.cfgNumPlusOneAndCopy()
 			fromGid := sc.configs[sc.cfgNum].Shards[args.Shard]
@@ -321,6 +395,7 @@ func (sc *ShardCtrler) applyOp(op Op) (Config, Err) {
 			if sc.gidMapShardNum[toGid] > NShards {
 				panic("gidMapShardNum[toGid] can not above NShards")
 			}
+			sc.configs[sc.cfgNum].Shards[args.Shard] = toGid
 			chgs = append(chgs, ShardChangeLog{
 				FromGid:     fromGid,
 				FromServers: sc.configs[sc.cfgNum].Groups[fromGid],
@@ -329,19 +404,21 @@ func (sc *ShardCtrler) applyOp(op Op) (Config, Err) {
 				ShardNum:    args.Shard,
 			})
 			sc.solveChanges(chgs, true)
+			sc.checkSum()
 		}
 	case QueryT:
 		{
 			args := op.Args.(QueryArgs)
 			num := args.Num
+			DPrintf("[sc %v] try to query, Num = %v\n", sc.me, args.Num)
 			if args.Num == -1 || args.Num > sc.cfgNum {
 				num = sc.cfgNum
 			}
 			cfg := sc.configs[num]
-			return cfg, OK
+			return cfg
 		}
 	}
-	return sc.configs[sc.cfgNum], OK
+	return sc.configs[sc.cfgNum]
 }
 func (sc *ShardCtrler) applier() {
 	for msg := range sc.applyCh {
@@ -360,34 +437,137 @@ func (sc *ShardCtrler) applier() {
 		op := msg.Command.(Op)
 		cid := op.Cid
 		opChan, ok := sc.dupTable.tryGetOpChan(cid)
-		if cid.NextCallIndex <= sc.clientLastIndex[cid.ClerkId] {
+		DPrintf("[sc %v] opchan = %v\n", sc.me, opChan)
+		if _, okk := sc.clientLastIndex[cid.ClerkId]; okk && cid.NextCallIndex <= sc.clientLastIndex[cid.ClerkId] {
+			DPrintf("[sc %v] dup of getNextC = %v, expect should bigger than %v\n", sc.me, cid.NextCallIndex, sc.clientLastIndex[cid.ClerkId])
+			if ok {
+				var cfg Config
+				var num int = sc.cfgNum
+				if op.Type == QueryT {
+					if _, ok := sc.queryNumHistory[op.Cid]; ok {
+						num = sc.queryNumHistory[op.Cid]
+					}
+					cfg = sc.configs[num]
+				} else {
+					cfg = Config{}
+				}
+				opChan.cond.L.Lock()
+				DPrintf("[sc %v] make opChan res = OpResOK\n", sc.me)
+				opChan.opRes = OpResOk
+				opChan.res = cfg
+				opChan.cond.Broadcast()
+				opChan.cond.L.Unlock()
+			}
 			sc.mu.Unlock()
 			continue
 		}
+		//DPrintf("[sc %v] apply op = %v\n", sc.me, op)
+		cfg := sc.applyOp(op)
+		DPrintf("[sc %v] apply op = %v, latest config = %v\n", sc.me, op, cfg)
 		if ok {
 			opChan.cond.L.Lock()
+			DPrintf("[sc %v] make opChan res = OpResOK\n", sc.me)
 			opChan.opRes = OpResOk
+			opChan.res = cfg
 			opChan.cond.Broadcast()
 			opChan.cond.L.Unlock()
+		}
+		if op.Type == QueryT {
+			num := op.Args.(QueryArgs).Num
+			if op.Args.(QueryArgs).Num == -1 || op.Args.(QueryArgs).Num > sc.cfgNum {
+				num = sc.cfgNum
+			}
+			sc.queryNumHistory[op.Cid] = num
 		}
 		sc.clientLastIndex[cid.ClerkId] = cid.NextCallIndex
 		sc.mu.Unlock()
 	}
 }
+func freshOpChan(index int) OpChan {
+	return OpChan{
+		cond:  utils.NewCond(&sync.Mutex{}),
+		opRes: OpUnknown,
+		index: index,
+		res:   Config{},
+	}
+}
+func (sc *ShardCtrler) waitForCondTimeOutNoneLock(opChan *OpChan, cid ClientId) (Err, Config) {
+	opChan.cond.L.Lock()
+	var err Err
+	var cfg Config
+	if opChan.opRes == OpUnknown {
+		opChan.cond.WaitWithTimeout(time.Second)
+	}
+	if opChan.opRes == OpUnknown {
+		err = TimeOut
+		cfg = Config{}
+		opChan.cond.L.Unlock()
+	} else {
+		err = OK
+		cfg = opChan.res
+		opChan.cond.L.Unlock()
+		sc.mu.Lock()
+		sc.dupTable.clearByClientId(cid.previousCallIndex())
+		sc.mu.Unlock()
+	}
+	return err, cfg
+}
+func (sc *ShardCtrler) startOp(op Op) (wrongLeader bool, err Err, cfg Config) {
+	sc.mu.Lock()
+	index, _, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		DPrintf("[sc %v] not leader, failed\n", sc.me)
+		sc.mu.Unlock()
+		wrongLeader = true
+		err = WrongLeader
+		return
+	}
+	opChan := freshOpChan(index)
+	sc.dupTable.insert(op.Cid, &opChan)
+	DPrintf("[sc %v] now cache table = %v\n", sc.me, sc.dupTable)
+	sc.mu.Unlock()
+	wrongLeader = false
+	err, cfg = sc.waitForCondTimeOutNoneLock(&opChan, op.Cid)
+	return
+}
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
+	DPrintf("[sc %v] try to join, args = %v\n", sc.me, args)
+	op := Op{Type: JoinT, Args: *args, Cid: args.Cid}
+	wrongLeader, err, _ := sc.startOp(op)
+	reply.WrongLeader = wrongLeader
+	reply.Err = err
+	DPrintf("[sc %v] finished join, res = %v\n", sc.me, reply)
+	return
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
+	op := Op{Type: LeaveT, Args: *args, Cid: args.Cid}
+	wrongLeader, err, _ := sc.startOp(op)
+	reply.WrongLeader = wrongLeader
+	reply.Err = err
+	return
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+	op := Op{Type: MoveT, Args: *args, Cid: args.Cid}
+	wrongLeader, err, _ := sc.startOp(op)
+	reply.WrongLeader = wrongLeader
+	reply.Err = err
+	return
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
+	op := Op{Type: QueryT, Args: *args, Cid: args.Cid}
+	wrongLeader, err, cfg := sc.startOp(op)
+	reply.WrongLeader = wrongLeader
+	reply.Config = cfg
+	reply.Err = err
+	DPrintf("[sc %v] finished query, res = %v\n", sc.me, reply)
+	return
 }
 
 // the tester calls Kill() when a ShardCtrler instance won't
@@ -397,6 +577,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 func (sc *ShardCtrler) Kill() {
 	sc.rf.Kill()
 	atomic.StoreInt32(&sc.dead, 1)
+
 	// Your code here, if desired.
 }
 func (sc *ShardCtrler) Killed() bool {
@@ -418,12 +599,25 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	sc.configs = make([]Config, 1)
 	sc.configs[0].Groups = map[int][]string{}
+	sc.cfgNum = 0
 	atomic.StoreInt32(&sc.dead, 0)
 	labgob.Register(Op{})
+	labgob.Register(QueryArgs{})
+	labgob.Register(JoinArgs{})
+	labgob.Register(LeaveArgs{})
+	labgob.Register(MoveArgs{})
 	sc.applyCh = make(chan raft.ApplyMsg)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
-
+	sc.dupTable = CacheTable{
+		dupTable: make(map[ClientId]*OpChan),
+		IndexId:  make(map[int]ClientId),
+	}
+	sc.gidMapShardNum = map[int]int{}
+	sc.gidMapShardNum[0] = NShards
+	sc.lastAppliedIndex = 0
+	sc.clientLastIndex = map[int]int{}
+	sc.queryNumHistory = map[ClientId]int{}
 	// Your code here.
-
+	go sc.applier()
 	return sc
 }
