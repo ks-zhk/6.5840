@@ -105,8 +105,18 @@ type ShardKV struct {
 	persister           *raft.Persister
 
 	stateMachine map[string]string
+	// 表示其负责的shard
+	respShard []int
 }
 
+func intExitInArray(ele int, arr []int) bool {
+	for _, el := range arr {
+		if ele == el {
+			return true
+		}
+	}
+	return false
+}
 func (kv *ShardKV) applyCommand(op Op) string {
 	if op.Type == AppendOp {
 		if m, ok := kv.stateMachine[op.Key]; ok {
