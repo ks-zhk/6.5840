@@ -42,3 +42,9 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+type TransferArgs struct {
+	CfgNum int
+	KV     map[string]string
+}
+type TransferReply struct {
+}
