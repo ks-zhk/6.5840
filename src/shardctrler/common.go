@@ -28,6 +28,17 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (cfg *Config) Clone() Config {
+	cfgC := Config{}
+	cfgC.Num = cfg.Num
+	cfgC.Shards = cfg.Shards
+	cfgC.Groups = make(map[int][]string)
+	for k, v := range cfg.Groups {
+		cfgC.Groups[k] = v
+	}
+	return cfgC
+}
+
 const (
 	OK          = "OK"
 	SomeErr     = "Err"

@@ -52,6 +52,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+
 	return ck
 }
 
@@ -97,7 +98,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Value = value
 	args.Op = op
 
-
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -121,6 +121,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 }
 
+//func (ck *Clerk) Migrate(cfg shardctrler.Config, kv map[string]string) {
+//	args := MigrateArgs{}
+//	args.Cfg = cfg
+//	args.KV = kv
+//
+//}
 func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
