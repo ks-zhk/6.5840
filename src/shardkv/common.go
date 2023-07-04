@@ -18,6 +18,8 @@ const (
 	ErrWrongLeader     = "ErrWrongLeader"
 	ErrConfigNotLatest = "ErrNotLatest"
 	ErrTooNew          = "ErrTooNew" // 表示cfg太新了，延缓处理。
+	ErrTooOld          = "ErrTooOld"
+	ErrCommitFail      = "ErrCommitFail"
 )
 
 type Err string

@@ -58,8 +58,9 @@ func (cd *ClientId) previousCallIndex() ClientId {
 type OpRes int
 
 const (
-	OpResOk   OpRes = 0
-	OpUnknown OpRes = 1
+	OpResOk      OpRes = 0
+	OpUnknown    OpRes = 1
+	OpWrongGroup OpRes = 2
 )
 
 type OpType int
@@ -69,7 +70,7 @@ const (
 	PutOp        OpType = 1
 	GetLog       OpType = 2
 	NoneOp       OpType = 3
-	CfgChgLog    OpType = 4 // 改变config
+	CfgChgLog    OpType = 4
 	GoFlightLog  OpType = 5
 	GetFlightLog OpType = 6
 )
@@ -82,7 +83,10 @@ type Op struct {
 	Args string
 	Type OpType
 	Cid  ClientId
+	Mid  MigrateId
 	Cfg  shardctrler.Config
+	KV   map[string]string
+	Gid  int
 }
 type OpChan struct {
 	index int
@@ -90,9 +94,16 @@ type OpChan struct {
 	opRes OpRes
 	val   string
 }
+
 type MigrateInfo struct {
-	flightFinished  map[int]bool
-	waitGetFinished map[int]bool
+	flightFinished   map[int]bool
+	waitGetFinished  map[int]bool
+	flightAims       []int
+	lastFlightSeqNum int
+}
+type MigrateId struct {
+	cfgNum int
+	seqNum int // from big to small, eg. 8,7,6,5,4,3,2,1,0
 }
 type ShardKV struct {
 	mu           sync.Mutex
@@ -110,6 +121,7 @@ type ShardKV struct {
 	clientLastCallIndex  map[int]int
 	lastApplied          int
 	cacheTable           CacheTable
+	migrateDupTbl        map[MigrateId]*OpChan
 	snapshot             []byte
 	snapshotLastIndex    int
 	persister            *raft.Persister
@@ -117,9 +129,12 @@ type ShardKV struct {
 
 	stateMachine map[string]string
 	// 表示其负责的shard
-	nextCfgNum  int
-	cfg         shardctrler.Config
-	migrateInfo MigrateInfo
+	nextCfgNum        int
+	cfg               shardctrler.Config
+	newCfg            shardctrler.Config
+	respShard         map[int]bool
+	migrateInfo       MigrateInfo
+	migratingToCfgNum int
 }
 
 func intExitInArray(ele int, arr []int) bool {
@@ -148,9 +163,6 @@ func (kv *ShardKV) applyCommand(op Op) string {
 	if op.Type == PutOp {
 		kv.stateMachine[op.Key] = op.Args
 	}
-	if op.Type == CfgChgLog {
-
-	}
 	if res, ok := kv.stateMachine[op.Key]; ok {
 		return res
 	} else {
@@ -177,22 +189,29 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 			}
 			kv.lastApplied = msg.CommandIndex
 			op := msg.Command.(Op)
-			opChan, ok := kv.cacheTable.tryGetOpChan(op.Cid)
-			if _, okk := kv.clientLastCallIndex[op.Cid.ClerkId]; okk && op.Cid.NextCallIndex <= kv.clientLastCallIndex[op.Cid.ClerkId] {
-				if ok {
-					opChan.ok(kv.clientQueryResStore[op.Cid])
+			if op.Type == PutOp || op.Type == AppendOp || op.Type == GetLog {
+				opChan, ok := kv.cacheTable.tryGetOpChan(op.Cid)
+				if _, okk := kv.clientLastCallIndex[op.Cid.ClerkId]; okk && op.Cid.NextCallIndex <= kv.clientLastCallIndex[op.Cid.ClerkId] {
+					if ok {
+						opChan.ok(kv.clientQueryResStore[op.Cid])
+					}
+					kv.mu.Unlock()
+					continue
 				}
-				kv.mu.Unlock()
-				continue
+				val := kv.applyCommand(op)
+				if ok {
+					opChan.ok(val)
+				}
+				if op.Type == GetLog {
+					kv.clientQueryResStore[op.Cid] = val
+				}
+				kv.clientLastCallIndex[op.Cid.ClerkId] = op.Cid.NextCallIndex
 			}
-			val := kv.applyCommand(op)
-			if ok {
-				opChan.ok(val)
+			if op.Type == CfgChgLog {
+				if kv.migratingToCfgNum == -1 && kv.nextCfgNum == op.Cfg.Num {
+					kv.migratingToCfgNum = kv.nextCfgNum
+				}
 			}
-			if op.Type == GetLog {
-				kv.clientQueryResStore[op.Cid] = val
-			}
-			kv.clientLastCallIndex[op.Cid.ClerkId] = op.Cid.NextCallIndex
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
 				kv.rf.Snapshot(kv.lastApplied, kv.makeSnapshotNoneLock(kv.lastApplied))
 			}
@@ -218,56 +237,132 @@ func (kv *ShardKV) makeMigrateInfo(newCfg shardctrler.Config) MigrateInfo {
 	}
 	aims := make(map[int]bool)
 	gets := make(map[int]bool)
+	flightAims := []int{}
 	for idx, val := range oldCfg.Shards {
 		if newCfg.Shards[idx] == val {
 			continue
 		}
 		if val == kv.gid {
-			aims[newCfg.Shards[idx]] = true
+			if _, ok := aims[newCfg.Shards[idx]]; !ok {
+				flightAims = append(flightAims, newCfg.Shards[idx])
+			}
+			aims[newCfg.Shards[idx]] = false
 		}
 		if newCfg.Shards[idx] == kv.gid {
-			gets[val] = true
+			gets[val] = false
 		}
 	}
 	return MigrateInfo{
-		flightFinished:  aims,
-		waitGetFinished: gets,
+		flightFinished:   aims,
+		waitGetFinished:  gets,
+		flightAims:       flightAims,
+		lastFlightSeqNum: 0,
 	}
 }
-func migrateTo(me int, nextCallIndex int, peers []*labrpc.ClientEnd, kv map[string]string, cfg shardctrler.Config) {
-	args := MigrateArgs{}
-	args.KV = kv
-	args.Cfg = cfg
-	args.Cid = ClientId{ClerkId: -me, NextCallIndex: nextCallIndex}
-	for i := 0; i < len(peers); i = (i + 1) % len(peers) {
-		reply := MigrateReply{}
-		ok := peers[i].Call("ShardKV.Migrate", &args, &reply)
-		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTooNew {
-			if i == len(peers)-1 {
-				time.Sleep(100 * time.Millisecond)
-			}
-			continue
-		}
-		break
+
+//func migrateTo(me int, nextCallIndex int, peers []*labrpc.ClientEnd, kv map[string]string, cfg shardctrler.Config) {
+//	args := MigrateArgs{}
+//	args.KV = kv
+//	args.Cfg = cfg
+//	args.Cid = ClientId{ClerkId: -me, NextCallIndex: nextCallIndex}
+//	for i := 0; i < len(peers); i = (i + 1) % len(peers) {
+//		reply := MigrateReply{}
+//		ok := peers[i].Call("ShardKV.Migrate", &args, &reply)
+//		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTooNew {
+//			if i == len(peers)-1 {
+//				time.Sleep(100 * time.Millisecond)
+//			}
+//			continue
+//		}
+//		break
+//	}
+//}
+
+//func (kv *ShardKV) isChangingNoneLock() bool {
+//	for _, v := range kv.migrateInfo.flightFinished {
+//		if !v {
+//			return true
+//		}
+//	}
+//	for _, v := range kv.migrateInfo.waitGetFinished {
+//		if !v {
+//			return true
+//		}
+//	}
+//	return false
+//}
+func (kv *ShardKV) putCfgChgLog(newCfg shardctrler.Config) Err {
+	kv.mu.Lock()
+	if newCfg.Num != kv.nextCfgNum {
+		kv.mu.Unlock()
+		return ErrTooOld
+	}
+	// TODO: 在applier的时候别忘了的生成cid
+	cid := ClientId{ClerkId: 0, NextCallIndex: newCfg.Num}
+	op := Op{
+		Type: CfgChgLog,
+		Cfg:  newCfg,
+		Cid:  cid,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		return ErrWrongLeader
+	}
+	opChan := OpChan{
+		cond:  utils.NewCond(&sync.Mutex{}),
+		index: index,
+		opRes: OpUnknown,
+		val:   "",
+	}
+	kv.cacheTable.insert(cid, &opChan)
+	kv.mu.Unlock()
+	opChan.cond.L.Lock()
+	if opChan.opRes == OpUnknown {
+		opChan.cond.WaitWithTimeout(time.Second)
+	}
+	defer opChan.cond.L.Unlock()
+	if opChan.opRes == OpUnknown {
+		return ErrCommitFail
+	} else {
+		return OK
 	}
 }
-func (kv *ShardKV) isChangingNoneLock() bool {
-	for _, v := range kv.migrateInfo.flightFinished {
-		if !v {
-			return true
-		}
+func (kv *ShardKV) putFlight(cfgNum int, seqNum int, aim int) Err {
+	kv.mu.Lock()
+	mid := MigrateId{cfgNum: cfgNum, seqNum: seqNum}
+	op := Op{
+		Type: GoFlightLog,
+		Mid:  mid,
+		Gid:  aim,
 	}
-	for _, v := range kv.migrateInfo.waitGetFinished {
-		if !v {
-			return true
-		}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		return ErrWrongLeader
 	}
-	return false
+	opChan := OpChan{
+		cond:  utils.NewCond(&sync.Mutex{}),
+		index: index,
+		opRes: OpUnknown,
+		val:   "",
+	}
+	kv.migrateDupTbl[mid] = &opChan
+	kv.mu.Unlock()
+	opChan.cond.L.Lock()
+	if opChan.opRes == OpUnknown {
+		opChan.cond.WaitWithTimeout(time.Second)
+	}
+	defer opChan.cond.L.Unlock()
+	if opChan.opRes == OpUnknown {
+		return ErrCommitFail
+	} else {
+		return OK
+	}
 }
 func (kv *ShardKV) configDetection() {
 	clerk := shardctrler.MakeClerk(kv.ctrlers)
 	var cfg shardctrler.Config
-	nextCallIndex := 0
 	for !kv.killed() {
 		// 每隔100毫秒询问一次配置服务器
 		time.Sleep(100 * time.Millisecond)
@@ -279,39 +374,39 @@ func (kv *ShardKV) configDetection() {
 		nextCfgNum := kv.nextCfgNum
 		kv.mu.Unlock()
 		cfg = clerk.Query(nextCfgNum)
+		cfgChgLogOk := false
 		for {
-			kv.mu.Lock()
-			if cfg.Num != kv.nextCfgNum || kv.isChangingNoneLock() {
-				kv.mu.Unlock()
+			res := kv.putCfgChgLog(cfg)
+			if res == OK {
+				cfgChgLogOk = true
 				break
 			}
-			cid := ClientId{ClerkId: 0, NextCallIndex: nextCallIndex}
-			op := Op{
-				Type: CfgChgLog,
-				Cfg:  cfg,
-				Cid:  cid,
-			}
-			index, _, isLeader := kv.rf.Start(op)
-			if !isLeader {
-				break
-			}
-			opChan := OpChan{
-				cond:  utils.NewCond(&sync.Mutex{}),
-				index: index,
-				opRes: OpUnknown,
-				val:   "",
-			}
-			kv.cacheTable.insert(cid, &opChan)
-			kv.mu.Unlock()
-			opChan.cond.L.Lock()
-			if opChan.opRes == OpUnknown {
-				opChan.cond.WaitWithTimeout(time.Second)
-			}
-			if opChan.opRes == OpResOk {
+			if res == ErrWrongLeader {
 				break
 			}
 		}
-		nextCallIndex += 1
+		if !cfgChgLogOk {
+			continue
+		}
+		migrateInfo := kv.makeMigrateInfo(cfg)
+		for idx, aim := range migrateInfo.flightAims {
+			flightOk := false
+			for {
+				res := kv.putFlight(cfg.Num, idx, aim)
+				if res == OK {
+					flightOk = true
+					break
+				}
+				if res == ErrWrongLeader {
+					// !!!防止cpu占用率过高。
+					time.Sleep(time.Millisecond * 50)
+					break
+				}
+			}
+			if !flightOk {
+				break
+			}
+		}
 	}
 }
 func (kv *ShardKV) makeSnapshotNoneLock(snapshotIndex int) []byte {
@@ -348,13 +443,121 @@ func (kv *ShardKV) installSnapshotNoneLock(snapshot []byte) {
 }
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	cid := args.Cid
+	op := Op{
+		Type: GetLog,
+		Cid:  cid,
+		Key:  args.Key,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	opChan := OpChan{
+		cond:  utils.NewCond(&sync.Mutex{}),
+		index: index,
+		opRes: OpUnknown,
+		val:   "",
+	}
+	kv.cacheTable.insert(cid, &opChan)
+	kv.mu.Unlock()
+	opChan.cond.L.Lock()
+	if opChan.opRes == OpUnknown {
+		opChan.cond.WaitWithTimeout(time.Second)
+	}
+	reply.Value = opChan.val
+	if opChan.opRes == OpUnknown {
+		reply.Err = ErrCommitFail
+	} else if opChan.opRes == OpWrongGroup {
+		reply.Err = ErrWrongGroup
+	} else {
+		reply.Err = OK
+	}
+	opChan.cond.L.Unlock()
+	return
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	cid := args.Cid
+	var tp OpType
+	if args.Op == "Put" {
+		tp = PutOp
+	} else {
+		tp = AppendOp
+	}
+	op := Op{
+		Type: tp,
+		Cid:  cid,
+		Key:  args.Key,
+		Args: args.Value,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	opChan := OpChan{
+		cond:  utils.NewCond(&sync.Mutex{}),
+		index: index,
+		opRes: OpUnknown,
+		val:   "",
+	}
+	kv.cacheTable.insert(cid, &opChan)
+	kv.mu.Unlock()
+	opChan.cond.L.Lock()
+	if opChan.opRes == OpUnknown {
+		opChan.cond.WaitWithTimeout(time.Second)
+	}
+	if opChan.opRes == OpUnknown {
+		reply.Err = ErrCommitFail
+	} else if opChan.opRes == OpWrongGroup {
+		reply.Err = ErrWrongGroup
+	} else {
+		reply.Err = OK
+	}
+	opChan.cond.L.Unlock()
+	return
+
 }
 func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
-
+	kv.mu.Lock()
+	cid := ClientId{ClerkId: -args.Cid.ClerkId, NextCallIndex: args.Cid.NextCallIndex}
+	op := Op{
+		Type: GetFlightLog,
+		KV:   args.KV,
+		Cid:  cid, // [gid]cfgNum
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	opChan := OpChan{
+		cond:  utils.NewCond(&sync.Mutex{}),
+		index: index,
+		opRes: OpUnknown,
+		val:   "",
+	}
+	kv.cacheTable.insert(cid, &opChan)
+	kv.mu.Unlock()
+	opChan.cond.L.Lock()
+	if opChan.opRes == OpUnknown {
+		opChan.cond.WaitWithTimeout(time.Second)
+	}
+	if opChan.opRes == OpUnknown {
+		reply.Err = ErrCommitFail
+	} else {
+		reply.Err = OK
+	}
+	opChan.cond.L.Unlock()
+	return
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -411,6 +614,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.cfg = shardctrler.Config{}
 	kv.cfg.Groups = make(map[int][]string)
 	kv.cfg.Num = 0
+	kv.newCfg = shardctrler.Config{}
+	kv.migratingToCfgNum = -1 // -1 means finished
 	// Your initialization code here.
 
 	// Use something like this to talk to the shardctrler:
