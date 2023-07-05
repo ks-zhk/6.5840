@@ -31,7 +31,7 @@ type ShardCtrler struct {
 	dupTable         CacheTable
 }
 
-const debugMode bool = true
+const debugMode bool = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if debugMode {

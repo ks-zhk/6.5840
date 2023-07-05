@@ -13,6 +13,15 @@ import "6.5840/raft"
 import "sync"
 import "6.5840/labgob"
 
+const debugMode bool = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if debugMode {
+		log.Printf(format, a...)
+	}
+	return
+}
+
 type ClientId struct {
 	ClerkId       int
 	NextCallIndex int
@@ -99,21 +108,21 @@ type OpChan struct {
 }
 
 type MigrateInfo struct {
-	flightFinished   map[int]bool
-	flightShardInfo  map[int][]int
-	waitGetFinished  map[int]bool
-	waitGetShardInfo map[int][]int
-	flightAims       []int
-	lastFlightSeqNum int
+	FlightFinished   map[int]bool
+	FlightShardInfo  map[int][]int
+	WaitGetFinished  map[int]bool
+	WaitGetShardInfo map[int][]int
+	FlightAims       []int
+	LastFlightSeqNum int
 }
 
 func (mgi *MigrateInfo) mgInfoFinished() bool {
-	for _, v := range mgi.flightFinished {
+	for _, v := range mgi.FlightFinished {
 		if v == false {
 			return false
 		}
 	}
-	for _, v := range mgi.waitGetFinished {
+	for _, v := range mgi.WaitGetFinished {
 		if v == false {
 			return false
 		}
@@ -122,8 +131,8 @@ func (mgi *MigrateInfo) mgInfoFinished() bool {
 }
 
 type MigrateId struct {
-	cfgNum int
-	seqNum int // from big to small, eg. 8,7,6,5,4,3,2,1,0
+	CfgNum int
+	SeqNum int // from big to small, eg. 8,7,6,5,4,3,2,1,0
 }
 type ShardKV struct {
 	mu           sync.Mutex
@@ -216,6 +225,7 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 			}
 			kv.lastApplied = msg.CommandIndex
 			op := msg.Command.(Op)
+			DPrintf("[ssc %v] get applier msg, type = %v [0: AppendOP, 1: PutOp, 2: GetLog, 3: NoneOp, 4: CfgChgLog, 5: GoFlightLog, 6: GetFlightLog]\n", kv.me, op.Type)
 			if op.Type == PutOp || op.Type == AppendOp || op.Type == GetLog {
 				opChan, ok := kv.cacheTable.tryGetOpChan(op.Cid)
 				if _, okk := kv.clientLastCallIndex[op.Cid.ClerkId]; okk && op.Cid.NextCallIndex <= kv.clientLastCallIndex[op.Cid.ClerkId] {
@@ -225,12 +235,20 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 					kv.mu.Unlock()
 					continue
 				}
-				val := kv.applyCommand(op)
-				if ok {
-					opChan.ok(val)
-				}
-				if op.Type == GetLog {
-					kv.clientQueryResStore[op.Cid] = val
+				if !kv.respShard[key2shard(op.Key)] {
+					// TODO: solve the result
+					DPrintf("[ssc %v] try to append/put/get kv, but this group is not resp for this shard %v\n", kv.me, key2shard(op.Key))
+					if ok {
+						opChan.finish(OpWrongGroup, "")
+					}
+				} else {
+					val := kv.applyCommand(op)
+					if ok {
+						opChan.ok(val)
+					}
+					if op.Type == GetLog {
+						kv.clientQueryResStore[op.Cid] = val
+					}
 				}
 				kv.clientLastCallIndex[op.Cid.ClerkId] = op.Cid.NextCallIndex
 			}
@@ -239,41 +257,19 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 				if op.Cfg.Num > kv.nextCfgNum {
 					panic("op.Cfg.Num > kv.nextCfgNum")
 				}
+				DPrintf("[ssc %v] try to commit new Config = %v\n", kv.me, op.Cfg)
 				cfgLogOpChan, ok := kv.cacheTable.tryGetOpChan(op.Cid)
 
 				if kv.migratingToCfgNum == -1 && kv.nextCfgNum == op.Cfg.Num {
 					kv.migratingToCfgNum = kv.nextCfgNum
 					kv.newCfg = op.Cfg
 					kv.migrateInfo = kv.makeMigrateInfo(op.Cfg)
-					for k, _ := range kv.migrateInfo.waitGetFinished {
-						if k == 0 {
-							kv.migrateInfo.waitGetFinished[k] = true
-							for _, shard := range kv.migrateInfo.flightShardInfo[k] {
-								kv.respShard[shard] = true
-							}
-						}
-					}
-					for k, v := range kv.migrateInfo.flightShardInfo {
-						if k == 0 {
-							kv.migrateInfo.flightFinished[k] = true
-							toClear := []string{}
-							for kk, _ := range kv.stateMachine {
-								if intExitInArray(key2shard(kk), v) {
-									toClear = append(toClear, kk)
-								}
-							}
-							for _, shard := range v {
-								kv.respShard[shard] = false
-							}
-							for _, key := range toClear {
-								delete(kv.stateMachine, key)
-							}
-						}
-					}
+					kv.solveZeroMigrate()
 					if kv.migrateInfo.mgInfoFinished() {
 						kv.migratingToCfgNum = -1
 						kv.nextCfgNum += 1
 					}
+					kv.checkStateMachine()
 				}
 				if kv.nextCfgNum > op.Cfg.Num {
 					if ok {
@@ -308,19 +304,48 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 		}
 	}
 }
+func (kv *ShardKV) solveZeroMigrate() {
+	for k, _ := range kv.migrateInfo.WaitGetFinished {
+		if k == 0 {
+			kv.migrateInfo.WaitGetFinished[k] = true
+			for _, shard := range kv.migrateInfo.FlightShardInfo[k] {
+				kv.respShard[shard] = true
+			}
+			break
+		}
+	}
+	for k, v := range kv.migrateInfo.FlightShardInfo {
+		if k == 0 {
+			kv.migrateInfo.FlightFinished[k] = true
+			toClear := []string{}
+			for kk, _ := range kv.stateMachine {
+				if intExitInArray(key2shard(kk), v) {
+					toClear = append(toClear, kk)
+				}
+			}
+			for _, shard := range v {
+				kv.respShard[shard] = false
+			}
+			for _, key := range toClear {
+				delete(kv.stateMachine, key)
+			}
+			break
+		}
+	}
+}
 func (kv *ShardKV) onGoFlightLog(op Op) {
 	if op.Type != GoFlightLog {
 		panic("type is not GoFlightLog")
 	}
 	GoFlightLogOpChan, ok := kv.migrateDupTbl[op.Mid]
-	if op.Mid.cfgNum > kv.nextCfgNum {
+	if op.Mid.CfgNum > kv.nextCfgNum {
 		panic("op.Mid.cfgNum > kv.nextCfgNum")
 	}
-	if kv.migratingToCfgNum == -1 && op.Mid.cfgNum == kv.nextCfgNum {
+	if kv.migratingToCfgNum == -1 && op.Mid.CfgNum == kv.nextCfgNum {
 		panic("kv.migratingToCfgNum == -1 && op.Mid.cfgNum == kv.nextCfgNum")
 	}
-	if kv.migratingToCfgNum == op.Mid.cfgNum {
-		res, okk := kv.migrateInfo.flightFinished[op.Gid]
+	if kv.migratingToCfgNum == op.Mid.CfgNum {
+		res, okk := kv.migrateInfo.FlightFinished[op.Gid]
 		if !okk {
 			panic("!okk")
 		}
@@ -349,15 +374,19 @@ func (kv *ShardKV) onGoFlightLog(op Op) {
 					}
 					continue
 				}
+				if reply.Err == OK || reply.Err == ErrTooOld {
+					break
+				}
 				break
 			}
-			kv.migrateInfo.flightFinished[op.Gid] = true
+			kv.migrateInfo.FlightFinished[op.Gid] = true
 			// we can clear
 			// TODO: challenge1, garbage clear
 			kv.clearGarbageKVNoneLock(op.Gid)
-			for _, shard := range kv.migrateInfo.flightShardInfo[op.Gid] {
+			for _, shard := range kv.migrateInfo.FlightShardInfo[op.Gid] {
 				kv.respShard[shard] = false
 			}
+			kv.checkStateMachine()
 			if kv.migrateInfo.mgInfoFinished() {
 				kv.nextCfgNum = kv.nextCfgNum + 1
 				kv.migratingToCfgNum = -1
@@ -367,17 +396,22 @@ func (kv *ShardKV) onGoFlightLog(op Op) {
 			GoFlightLogOpChan.ok("")
 		}
 	}
-	if kv.migratingToCfgNum == -1 && op.Mid.cfgNum < kv.nextCfgNum {
+	if kv.migratingToCfgNum == -1 && op.Mid.CfgNum < kv.nextCfgNum {
 		// must dup, just success
 		if ok {
 			GoFlightLogOpChan.ok("")
+		}
+	}
+	if op.Mid.CfgNum > kv.nextCfgNum {
+		if ok {
+			GoFlightLogOpChan.finish(OpFlightTooNew, "")
 		}
 	}
 }
 func (kv *ShardKV) clearGarbageKVNoneLock(gid int) {
 	toClear := []string{}
 	for k, _ := range kv.stateMachine {
-		if intExitInArray(key2shard(k), kv.migrateInfo.flightShardInfo[gid]) {
+		if intExitInArray(key2shard(k), kv.migrateInfo.FlightShardInfo[gid]) {
 			toClear = append(toClear, k)
 		}
 	}
@@ -395,28 +429,35 @@ func (kv *ShardKV) onGetFlightLog(op Op) {
 		kv.migratingToCfgNum = op.Cfg.Num
 		kv.newCfg = op.Cfg
 		kv.migrateInfo = kv.makeMigrateInfo(op.Cfg)
+		kv.solveZeroMigrate()
+		if kv.migrateInfo.mgInfoFinished() {
+			kv.migratingToCfgNum = -1
+			kv.nextCfgNum += 1
+			panic("can not become finished")
+		}
 	}
 	getFlightLogOpChan, ok := kv.cacheTable.tryGetOpChan(op.Cid)
 	if op.Cfg.Num == kv.migratingToCfgNum {
 		// 1. 已经进入了，开始尝试进行匹配
-		res, okk := kv.migrateInfo.waitGetFinished[op.Gid]
+		res, okk := kv.migrateInfo.WaitGetFinished[op.Gid]
 		if !okk {
 			panic("should not get migrate from this peer, invalid")
 		}
 		if res == false {
 			// begin get into state machine
 			for k, v := range op.KV {
-				if intExitInArray(key2shard(k), kv.migrateInfo.waitGetShardInfo[op.Gid]) {
+				if intExitInArray(key2shard(k), kv.migrateInfo.WaitGetShardInfo[op.Gid]) {
 					kv.stateMachine[k] = v
 				}
 			}
-			kv.migrateInfo.waitGetFinished[op.Gid] = true
-			for _, shard := range kv.migrateInfo.waitGetShardInfo[op.Gid] {
+			kv.migrateInfo.WaitGetFinished[op.Gid] = true
+			for _, shard := range kv.migrateInfo.WaitGetShardInfo[op.Gid] {
 				kv.respShard[shard] = true
 			}
 			if kv.migrateInfo.mgInfoFinished() {
 				kv.nextCfgNum = kv.nextCfgNum + 1
 				kv.migratingToCfgNum = -1
+				kv.checkStateMachine()
 			}
 		}
 		if ok {
@@ -445,14 +486,14 @@ func (kv *ShardKV) makeMigrateInfo(newCfg shardctrler.Config) MigrateInfo {
 	gets := make(map[int]bool)
 	getsInfo := make(map[int][]int)
 	aimsInfo := make(map[int][]int)
-	flightAims := []int{}
+	FlightAims := []int{}
 	for idx, val := range oldCfg.Shards {
 		if newCfg.Shards[idx] == val {
 			continue
 		}
 		if val == kv.gid {
 			if _, ok := aims[newCfg.Shards[idx]]; !ok {
-				flightAims = append(flightAims, newCfg.Shards[idx])
+				FlightAims = append(FlightAims, newCfg.Shards[idx])
 				aimsInfo[newCfg.Shards[idx]] = []int{}
 			}
 			aimsInfo[newCfg.Shards[idx]] = append(aimsInfo[newCfg.Shards[idx]], idx)
@@ -467,46 +508,14 @@ func (kv *ShardKV) makeMigrateInfo(newCfg shardctrler.Config) MigrateInfo {
 		}
 	}
 	return MigrateInfo{
-		flightFinished:   aims,
-		flightShardInfo:  aimsInfo,
-		waitGetFinished:  gets,
-		waitGetShardInfo: getsInfo,
-		flightAims:       flightAims,
-		lastFlightSeqNum: 0,
+		FlightFinished:   aims,
+		FlightShardInfo:  aimsInfo,
+		WaitGetFinished:  gets,
+		WaitGetShardInfo: getsInfo,
+		FlightAims:       FlightAims,
+		LastFlightSeqNum: 0,
 	}
 }
-
-//func migrateTo(me int, nextCallIndex int, peers []*labrpc.ClientEnd, kv map[string]string, cfg shardctrler.Config) {
-//	args := MigrateArgs{}
-//	args.KV = kv
-//	args.Cfg = cfg
-//	args.Cid = ClientId{ClerkId: -me, NextCallIndex: nextCallIndex}
-//	for i := 0; i < len(peers); i = (i + 1) % len(peers) {
-//		reply := MigrateReply{}
-//		ok := peers[i].Call("ShardKV.Migrate", &args, &reply)
-//		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTooNew {
-//			if i == len(peers)-1 {
-//				time.Sleep(100 * time.Millisecond)
-//			}
-//			continue
-//		}
-//		break
-//	}
-//}
-
-//func (kv *ShardKV) isChangingNoneLock() bool {
-//	for _, v := range kv.migrateInfo.flightFinished {
-//		if !v {
-//			return true
-//		}
-//	}
-//	for _, v := range kv.migrateInfo.waitGetFinished {
-//		if !v {
-//			return true
-//		}
-//	}
-//	return false
-//}
 func (kv *ShardKV) putCfgChgLog(newCfg shardctrler.Config) Err {
 	kv.mu.Lock()
 	if newCfg.Num != kv.nextCfgNum {
@@ -548,7 +557,7 @@ func (kv *ShardKV) putCfgChgLog(newCfg shardctrler.Config) Err {
 }
 func (kv *ShardKV) putFlight(cfgNum int, seqNum int, aim int) Err {
 	kv.mu.Lock()
-	mid := MigrateId{cfgNum: cfgNum, seqNum: seqNum}
+	mid := MigrateId{CfgNum: cfgNum, SeqNum: seqNum}
 	op := Op{
 		Type: GoFlightLog,
 		Mid:  mid,
@@ -574,6 +583,8 @@ func (kv *ShardKV) putFlight(cfgNum int, seqNum int, aim int) Err {
 	defer opChan.cond.L.Unlock()
 	if opChan.opRes == OpUnknown {
 		return ErrCommitFail
+	} else if opChan.opRes == OpFlightTooOld {
+		return ErrTooOld
 	} else {
 		return OK
 	}
@@ -599,7 +610,7 @@ func (kv *ShardKV) configDetection() {
 				cfgChgLogOk = true
 				break
 			}
-			if res == ErrWrongLeader {
+			if res == ErrWrongLeader || res == ErrTooOld {
 				break
 			}
 		}
@@ -607,7 +618,7 @@ func (kv *ShardKV) configDetection() {
 			continue
 		}
 		migrateInfo := kv.makeMigrateInfo(cfg)
-		for idx, aim := range migrateInfo.flightAims {
+		for idx, aim := range migrateInfo.FlightAims {
 			flightOk := false
 			for {
 				res := kv.putFlight(cfg.Num, idx, aim)
@@ -640,6 +651,7 @@ func (kv *ShardKV) makeSnapshotNoneLock(snapshotIndex int) []byte {
 	e.Encode(kv.respShard)
 	e.Encode(kv.migratingToCfgNum)
 	e.Encode(kv.migrateInfo)
+	e.Encode(kv.clientQueryResStore)
 	//e.Encode(kv.)
 	kv.lastApplied = snapshotIndex
 	return w.Bytes()
@@ -653,19 +665,39 @@ func (kv *ShardKV) installSnapshotNoneLock(snapshot []byte) {
 	var lastIncludedIndex int
 	var clientApplyInfo map[int]int
 	var stateMachine map[string]string
+	var cfg shardctrler.Config
+	var newCfg shardctrler.Config
+	var nextCfgNum int
+	var respShard map[int]bool
+	var migratingToCfgNum int
+	var migrateInfo MigrateInfo
+	var clientQueryResStore map[ClientId]string
 	if d.Decode(&lastIncludedIndex) != nil ||
 		d.Decode(&clientApplyInfo) != nil ||
-		d.Decode(&stateMachine) != nil {
+		d.Decode(&stateMachine) != nil ||
+		d.Decode(&cfg) != nil ||
+		d.Decode(&newCfg) != nil ||
+		d.Decode(&nextCfgNum) != nil ||
+		d.Decode(&respShard) != nil ||
+		d.Decode(&migratingToCfgNum) != nil ||
+		d.Decode(&migrateInfo) != nil ||
+		d.Decode(&clientQueryResStore) != nil {
 		log.Fatalf("snapshot decode error")
 	}
 	if lastIncludedIndex < kv.lastApplied {
 		return
 	}
-	//DPrintf("[s %v] install snapshot lastInclude Index = %v, clientApplyInfo = %v, stateMachine = %v\n", kv.me, lastIncludedIndex, clientApplyInfo, stateMachine)
 	kv.clientLastCallIndex = clientApplyInfo
 	kv.snapshotLastIndex = lastIncludedIndex
 	kv.lastApplied = lastIncludedIndex
 	kv.stateMachine = stateMachine
+	kv.cfg = cfg
+	kv.newCfg = newCfg
+	kv.nextCfgNum = nextCfgNum
+	kv.respShard = respShard
+	kv.migratingToCfgNum = migratingToCfgNum
+	kv.migrateInfo = migrateInfo
+	kv.clientQueryResStore = clientQueryResStore
 }
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
@@ -780,6 +812,10 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 	}
 	if opChan.opRes == OpUnknown {
 		reply.Err = ErrCommitFail
+	} else if opChan.opRes == OpFlightTooOld {
+		reply.Err = ErrTooOld
+	} else if opChan.opRes == OpFlightTooNew {
+		reply.Err = ErrTooNew
 	} else {
 		reply.Err = OK
 	}
@@ -799,6 +835,13 @@ func (kv *ShardKV) Kill() {
 func (kv *ShardKV) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+func (kv *ShardKV) checkStateMachine() {
+	for k, _ := range kv.stateMachine {
+		if !kv.respShard[key2shard(k)] {
+			panic("have key that does not response for")
+		}
+	}
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -831,9 +874,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
-
+	labgob.Register(MigrateInfo{})
+	labgob.Register(MigrateId{})
 	kv := new(ShardKV)
 	kv.me = me
+	kv.dead = 0
 	kv.maxraftstate = maxraftstate
 	kv.make_end = make_end
 	kv.gid = gid
@@ -850,6 +895,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.nextCfgNum = 1
+	kv.respShard = make(map[int]bool)
+	kv.stateMachine = make(map[string]string)
+	kv.persister = persister
+	kv.cacheTable = CacheTable{
+		dupTable: make(map[ClientId]*OpChan),
+		IndexId:  map[int]ClientId{},
+	}
+	kv.migrateDupTbl = map[MigrateId]*OpChan{}
+	kv.clientLastCallIndex = map[int]int{}
+	kv.lastApplied = 0
+	kv.clientQueryResStore = map[ClientId]string{}
 	kv.installSnapshotNoneLock(persister.ReadSnapshot())
+	go kv.configDetection()
 	return kv
 }
