@@ -51,9 +51,11 @@ type GetReply struct {
 	Value string
 }
 type MigrateArgs struct {
-	Cfg shardctrler.Config
-	KV  map[string]string
-	Cid ClientId
+	Cfg                 shardctrler.Config
+	KV                  map[string]string
+	ClientLastCallIndex map[int]int
+	ClientQueryResStore map[ClientId]string
+	Cid                 ClientId
 }
 type MigrateReply struct {
 	Cfg shardctrler.Config

@@ -355,6 +355,7 @@ func (sc *ShardCtrler) applyOp(op Op) Config {
 			chgs = append(chgs, sc.balance([]int{0})...)
 			sc.checkSum()
 			sc.solveChanges(chgs, true)
+			log.Printf("[ctler %v] new cfg = %v\n", sc.me, sc.configs[sc.cfgNum])
 		}
 	case LeaveT:
 		{
@@ -379,6 +380,7 @@ func (sc *ShardCtrler) applyOp(op Op) Config {
 			sc.checkSum()
 			sc.checkBalance()
 			sc.solveChanges(chgs, false)
+			log.Printf("[ctler %v] new cfg = %v\n", sc.me, sc.configs[sc.cfgNum])
 		}
 	case MoveT:
 		{
@@ -405,6 +407,7 @@ func (sc *ShardCtrler) applyOp(op Op) Config {
 			})
 			sc.solveChanges(chgs, true)
 			sc.checkSum()
+			log.Printf("[ctler %v] new cfg = %v\n", sc.me, sc.configs[sc.cfgNum])
 		}
 	case QueryT:
 		{
