@@ -2,6 +2,7 @@ package shardkv
 
 import (
 	"6.5840/porcupine"
+	"log"
 )
 import "6.5840/models"
 import "testing"
@@ -135,7 +136,7 @@ func TestJoinLeave(t *testing.T) {
 	}
 
 	// allow time for shards to transfer.
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	cfg.checklogs()
 	cfg.ShutdownGroup(0)
@@ -801,8 +802,11 @@ func TestChallenge1Delete(t *testing.T) {
 	total := 0
 	for gi := 0; gi < cfg.ngroups; gi++ {
 		for i := 0; i < cfg.n; i++ {
+			cfg.groups[gi].servers[i].displayDetailedInfo()
 			raft := cfg.groups[gi].saved[i].RaftStateSize()
+			log.Printf("raft size = %v\n", raft)
 			snap := len(cfg.groups[gi].saved[i].ReadSnapshot())
+			log.Printf("snapshot size = %v\n", snap)
 			total += raft + snap
 		}
 	}

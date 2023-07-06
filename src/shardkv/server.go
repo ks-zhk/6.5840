@@ -35,19 +35,11 @@ type CacheTable struct {
 
 func (ct *CacheTable) insert(clientId ClientId, op *OpChan) {
 	ct.dupTable[clientId] = op
-	ct.IndexId[op.index] = clientId
+	//ct.IndexId[op.index] = clientId
 }
 func (ct *CacheTable) tryGetOpChan(id ClientId) (*OpChan, bool) {
 	res, ok := ct.dupTable[id]
 	return res, ok
-}
-func (ct *CacheTable) tryGetByIndex(idx int) (*OpChan, bool) {
-	if id, ok := ct.IndexId[idx]; ok {
-		if op, okk := ct.dupTable[id]; okk {
-			return op, true
-		}
-	}
-	return nil, false
 }
 func (ct *CacheTable) clearByClientId(id ClientId) {
 	//delete(ct.dupTable, id)
@@ -57,10 +49,11 @@ func (ct *CacheTable) clearByClientId(id ClientId) {
 		delete(ct.dupTable, id)
 	}
 }
-func (ct *CacheTable) clearByPreviousId(id ClientId) {
-	pid := id.previousCallIndex()
-	ct.clearByClientId(pid)
-}
+
+//func (ct *CacheTable) clearByPreviousId(id ClientId) {
+//	pid := id.previousCallIndex()
+//	ct.clearByClientId(pid)
+//}
 func (cd *ClientId) previousCallIndex() ClientId {
 	return ClientId{ClerkId: cd.ClerkId, NextCallIndex: cd.NextCallIndex - 1}
 }
@@ -79,14 +72,13 @@ const (
 type OpType int
 
 const (
-	AppendOp          OpType = 0
-	PutOp             OpType = 1
-	GetLog            OpType = 2
-	NoneOp            OpType = 3
-	CfgChgLog         OpType = 4
-	GoFlightLog       OpType = 5
-	GetFlightLog      OpType = 6
-	CfgFlightFinished OpType = 7
+	AppendOp     OpType = 0
+	PutOp        OpType = 1
+	GetLog       OpType = 2
+	CfgChgLog    OpType = 4
+	GoFlightLog  OpType = 5
+	GetFlightLog OpType = 6
+	//CfgFlightFinished OpType = 7
 )
 
 type Op struct {
@@ -165,7 +157,7 @@ type ShardKV struct {
 	//migrateNextCallIndex int
 
 	stateMachine map[string]string
-	cfgOpChan    map[int]*OpChan
+	//cfgOpChan    map[int]*OpChan
 	// 表示其负责的shard
 	nextCfgNum        int
 	cfg               shardctrler.Config
@@ -228,6 +220,16 @@ func (opChan *OpChan) finish(opRes OpRes, val string) {
 	opChan.cond.Broadcast()
 	opChan.cond.L.Unlock()
 }
+func (kv *ShardKV) deletePreviousQueryRes(cid ClientId) {
+	ccid := ClientId{ClerkId: cid.ClerkId, NextCallIndex: cid.NextCallIndex - 1}
+	for ccid.NextCallIndex >= 0 {
+		if _, ok := kv.clientQueryResStore[ccid]; ok {
+			delete(kv.clientQueryResStore, ccid)
+			//break
+		}
+		ccid = ClientId{ClerkId: ccid.ClerkId, NextCallIndex: ccid.NextCallIndex - 1}
+	}
+}
 func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 	for msg := range ch {
 		if kv.killed() {
@@ -243,9 +245,10 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 			DPrintf("[ssc (%v,%v)] get applier msg, type = %v [0: AppendOP, 1: PutOp, 2: GetLog, 3: NoneOp, 4: CfgChgLog, 5: GoFlightLog, 6: GetFlightLog], op = %v\n", kv.gid, kv.me, op.Type, op)
 			if op.Type == PutOp || op.Type == AppendOp || op.Type == GetLog {
 				opChan, ok := kv.cacheTable.tryGetOpChan(op.Cid)
+				kv.deletePreviousQueryRes(op.Cid)
 				if _, okk := kv.clientLastCallIndex[op.Cid.ClerkId]; okk && op.Cid.NextCallIndex <= kv.clientLastCallIndex[op.Cid.ClerkId] {
 					if ok {
-						DPrintf("in thisssssssssssssssssssssssssssssssssss!\n")
+						//DPrintf("in thisssssssssssssssssssssssssssssssssss!\n")
 						opChan.ok(kv.clientQueryResStore[op.Cid])
 					}
 					kv.lastApplied = msg.CommandIndex
@@ -307,10 +310,10 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 
 				kv.onGoFlightLog(op)
 			}
-			if op.Type == CfgFlightFinished {
-				DPrintf("hererererrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\n")
-				//kv.onFlightFinishedNoneLock(op.Cfg.Num)
-			}
+			//if op.Type == CfgFlightFinished {
+			//	DPrintf("hererererrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\n")
+			//	//kv.onFlightFinishedNoneLock(op.Cfg.Num)
+			//}
 			kv.lastApplied = msg.CommandIndex
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
 				kv.rf.Snapshot(kv.lastApplied, kv.makeSnapshotNoneLock(kv.lastApplied))
@@ -451,6 +454,30 @@ func (kv *ShardKV) onGoFlightLog(op Op) {
 		}
 	}
 }
+func (kv *ShardKV) displayDetailedInfo() {
+	kv.mu.Lock()
+	keyNum := len(kv.stateMachine)
+	stateMachineSize := 0
+	for k, v := range kv.stateMachine {
+		stateMachineSize += len(k)
+		stateMachineSize += len(v)
+	}
+	cacheTblSize := len(kv.cacheTable.dupTable)
+	migTblSize := len(kv.migrateDupTbl)
+	lastQueryKeyNum := len(kv.clientQueryResStore)
+	lastQuerySolveSize := 0
+	for k, v := range kv.clientQueryResStore {
+		DPrintf("[ssc (%v, %v)] lastQueryKey = %v\n", kv.gid, kv.me, k)
+		lastQuerySolveSize += len(v)
+	}
+	DPrintf("[ssc (%v, %v)]sc_keyNum = %v, sc_size = %v, cacheTblSize = %v, migTblSize = %v, lastQueryKeyNum = %v, lastQuerySolveSize = %v\n", kv.gid, kv.me, keyNum, stateMachineSize, cacheTblSize, migTblSize, lastQueryKeyNum, lastQuerySolveSize)
+	kv.mu.Unlock()
+}
+func (kv *ShardKV) getKeyNum() int {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return len(kv.stateMachine)
+}
 func (kv *ShardKV) clearGarbageKVNoneLock(gid int) {
 	toClear := []string{}
 	for k, _ := range kv.stateMachine {
@@ -459,6 +486,7 @@ func (kv *ShardKV) clearGarbageKVNoneLock(gid int) {
 		}
 	}
 	for _, k := range toClear {
+		DPrintf("[ssc (%v, %v)] delete k %v\n", kv.gid, kv.me, k)
 		delete(kv.stateMachine, k)
 	}
 }
@@ -719,6 +747,11 @@ func (kv *ShardKV) putFlight(cfgNum int, seqNum int, aim int) Err {
 		opChan.cond.WaitWithTimeout(RES_TIMEOUT)
 	}
 	defer opChan.cond.L.Unlock()
+	//defer func(mid MigrateId) {
+	//	kv.mu.Lock()
+	//	delete(kv.migrateDupTbl, mid)
+	//	kv.mu.Unlock()
+	//}(mid)
 	if opChan.opRes == OpUnknown {
 		return ErrCommitFail
 	} else if opChan.opRes == OpFlightTooOld {
@@ -817,47 +850,47 @@ func (kv *ShardKV) configDetection() {
 		nextCfgNum := kv.nextCfgNum
 		kv.mu.Unlock()
 		cfg = clerk.Query(nextCfgNum)
-		go kv.tryToCommitChange(cfg)
-		//DPrintf("[ssc (%v, %v)] get an cfg from ctler = %v\n", kv.gid, kv.me, cfg)
-		//cfgChgLogOk := false
-		//for !kv.killed() {
-		//	res := kv.putCfgChgLog(cfg)
-		//	if res == OK {
-		//		cfgChgLogOk = true
-		//		break
-		//	}
-		//	if res == ErrWrongLeader || res == ErrTooOld {
-		//		break
-		//	}
-		//}
-		//if !cfgChgLogOk {
-		//	continue
-		//}
-		//DPrintf("[ssc %v] success put a CfgChgLog into Raft\n", kv.me)
-		//migrateInfo, ok := kv.makeMigrateInfo(cfg)
-		//if !ok {
-		//	continue
-		//}
-		//for idx, aim := range migrateInfo.FlightAims {
-		//	flightOk := false
-		//	for !kv.killed() {
-		//		res := kv.putFlight(cfg.Num, idx, aim)
-		//		if res == OK {
-		//			flightOk = true
-		//			break
-		//		}
-		//		if res == ErrTooOld || res == ErrWrongLeader {
-		//			break
-		//		}
-		//		if res == ErrCommitFail {
-		//			time.Sleep(time.Millisecond * 50)
-		//		}
-		//	}
-		//	if !flightOk {
-		//		break
-		//	}
-		//	DPrintf("[ssc %v] success put a flight aim = %v into raft log\n", kv.me, aim)
-		//}
+		//go kv.tryToCommitChange(cfg)
+		DPrintf("[ssc (%v, %v)] get an cfg from ctler = %v\n", kv.gid, kv.me, cfg)
+		cfgChgLogOk := false
+		for !kv.killed() {
+			res := kv.putCfgChgLog(cfg)
+			if res == OK {
+				cfgChgLogOk = true
+				break
+			}
+			if res == ErrWrongLeader || res == ErrTooOld {
+				break
+			}
+		}
+		if !cfgChgLogOk {
+			continue
+		}
+		DPrintf("[ssc %v] success put a CfgChgLog into Raft\n", kv.me)
+		migrateInfo, ok := kv.makeMigrateInfo(cfg)
+		if !ok {
+			continue
+		}
+		for idx, aim := range migrateInfo.FlightAims {
+			flightOk := false
+			for !kv.killed() {
+				res := kv.putFlight(cfg.Num, idx, aim)
+				if res == OK {
+					flightOk = true
+					break
+				}
+				if res == ErrTooOld || res == ErrWrongLeader {
+					break
+				}
+				if res == ErrCommitFail {
+					time.Sleep(time.Millisecond * 50)
+				}
+			}
+			if !flightOk {
+				break
+			}
+			DPrintf("[ssc %v] success put a flight aim = %v into raft log\n", kv.me, aim)
+		}
 	}
 }
 func (kv *ShardKV) makeSnapshotNoneLock(snapshotIndex int) []byte {
@@ -1031,6 +1064,7 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 	}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		DPrintf("[ssc (%v, %v)] is not leader, return wrong leader!\n", kv.gid, kv.me)
 		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
@@ -1142,7 +1176,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		dupTable: make(map[ClientId]*OpChan),
 		IndexId:  map[int]ClientId{},
 	}
-	kv.cfgOpChan = make(map[int]*OpChan)
+	//kv.cfgOpChan = make(map[int]*OpChan)
 	kv.migrateDupTbl = map[MigrateId]*OpChan{}
 	kv.clientLastCallIndex = map[int]int{}
 	kv.lastApplied = 0
