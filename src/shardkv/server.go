@@ -50,10 +50,10 @@ func (ct *CacheTable) clearByClientId(id ClientId) {
 	}
 }
 
-//func (ct *CacheTable) clearByPreviousId(id ClientId) {
-//	pid := id.previousCallIndex()
-//	ct.clearByClientId(pid)
-//}
+//	func (ct *CacheTable) clearByPreviousId(id ClientId) {
+//		pid := id.previousCallIndex()
+//		ct.clearByClientId(pid)
+//	}
 func (cd *ClientId) previousCallIndex() ClientId {
 	return ClientId{ClerkId: cd.ClerkId, NextCallIndex: cd.NextCallIndex - 1}
 }
@@ -182,11 +182,11 @@ func (kv *ShardKV) freshNewCfgNoneLock(newCfg shardctrler.Config) {
 	DPrintf("[scc (%v, %v)] update one fresh new cfg = %v, now resp_shard = %v\n", kv.gid, kv.me, kv.cfg, kv.respShard)
 }
 
-//func (kv *ShardKV) isChangingNoneLock() bool {
-//	kv.migrateNeed.cond.L.Lock()
-//	defer kv.migrateNeed.cond.L.Unlock()
-//	return kv.migrateNeed.needGetRPCNum != 0 || kv.migrateNeed.needSendRPCNum != 0
-//}
+//	func (kv *ShardKV) isChangingNoneLock() bool {
+//		kv.migrateNeed.cond.L.Lock()
+//		defer kv.migrateNeed.cond.L.Unlock()
+//		return kv.migrateNeed.needGetRPCNum != 0 || kv.migrateNeed.needSendRPCNum != 0
+//	}
 func (kv *ShardKV) applyCommand(op Op) string {
 	DPrintf("[ssc (%v, %v)] success apply op = %v\n", kv.gid, kv.me, op)
 	if op.Type == AppendOp {
@@ -288,7 +288,7 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 					kv.migrateInfo = kv.makeMigrateInfoNoneLock(op.Cfg)
 					kv.solveZeroMigrate()
 					if kv.migrateInfo.mgInfoFinished() {
-						kv.freshNewCfgNoneLock(op.Cfg)
+						kv.freshNewCfgNoneLock(kv.newCfg)
 					}
 					kv.checkStateMachine()
 				}
@@ -411,7 +411,7 @@ func (kv *ShardKV) onGoFlightLog(op Op) {
 				ress := peer.Call("ShardKV.Migrate", &args, &reply)
 				if ress == false || reply.Err == ErrWrongLeader || reply.Err == ErrTooNew {
 					if i == len(peers)-1 {
-						//time.Sleep(time.Millisecond * 100)
+						time.Sleep(time.Millisecond * 100)
 					}
 					DPrintf("[ssc (%v, %v)] Migrate fail, try again! with err = %v\n", kv.gid, kv.me, reply.Err)
 					continue
@@ -546,6 +546,7 @@ func (kv *ShardKV) onGetFlightLog(op Op) {
 	} else if op.Cfg.Num > kv.nextCfgNum {
 		// too new
 		DPrintf("[scc (%v,%v)] too new get a flight = %v from peer %v\n", kv.gid, kv.me, op, op.Gid)
+		DPrintf("[ssc (%v,%v)] mgInfo = %v\n", kv.gid, kv.me, kv.migrateInfo)
 		if ok {
 			getFlightLogOpChan.finish(OpFlightTooNew, "")
 		}
@@ -590,7 +591,7 @@ func (kv *ShardKV) onGetFlightLog(op Op) {
 //
 //}
 
-//func (kv *ShardKV) onTryToCommitFlights
+// func (kv *ShardKV) onTryToCommitFlights
 func (kv *ShardKV) makeMigrateInfoNoneLock(newCfg shardctrler.Config) MigrateInfo {
 	oldCfg := kv.cfg
 	if newCfg.Num != oldCfg.Num+1 {
