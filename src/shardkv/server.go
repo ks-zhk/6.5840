@@ -242,7 +242,7 @@ func (kv *ShardKV) applier(ch chan raft.ApplyMsg) {
 				continue
 			}
 			op := msg.Command.(Op)
-			DPrintf("[ssc (%v,%v)] get applier msg, type = %v [0: AppendOP, 1: PutOp, 2: GetLog, 3: NoneOp, 4: CfgChgLog, 5: GoFlightLog, 6: GetFlightLog], op = %v\n", kv.gid, kv.me, op.Type, op)
+			DPrintf("[ssc (%v,%v)] get applier msg, type = %v [0: AppendOP, 1: PutOp, 2: GetLog, 3: NoneOp, 4: CfgChgLog, 5: GoFlightLog, 6: GetFlightLog]\n", kv.gid, kv.me, op.Type)
 			if op.Type == PutOp || op.Type == AppendOp || op.Type == GetLog {
 				opChan, ok := kv.cacheTable.tryGetOpChan(op.Cid)
 				kv.deletePreviousQueryRes(op.Cid)
