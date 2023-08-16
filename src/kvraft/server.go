@@ -4,9 +4,12 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"6.5840/utils"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -17,24 +20,23 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
-func (kv *KVServer) MyDebugNoneLock(format string, a ...interface{}) {
-	DPrintf("KVServer id = %v", kv.me)
-	DPrintf(format, a...)
-}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type OpType
-	Key  string
-	Args string
+	Type     OpType
+	Key      string
+	Args     string
+	ClientId ClientId
 }
 type OpType int
 
 const (
 	AppendOp OpType = 0
 	PutOp    OpType = 1
+	GetLog   OpType = 2
+	NoneOp   OpType = 3
 )
 
 type OpRes int
@@ -45,11 +47,72 @@ const (
 	OpUnknown OpRes = 2
 )
 
+type ClientId struct {
+	ClerkId       int
+	NextCallIndex int
+}
+
+func (cd *ClientId) previousCallIndex() ClientId {
+	return ClientId{ClerkId: cd.ClerkId, NextCallIndex: cd.NextCallIndex - 1}
+}
+
 type OpChan struct {
 	expectTerm int
 	op         Op
-	cond       *sync.Cond
+	cond       *utils.MCond
 	opRes      OpRes
+	index      int
+	val        string
+}
+
+func (ch *OpChan) getOpResWithLock() OpRes {
+	ch.cond.L.Lock()
+	defer ch.cond.L.Unlock()
+	return ch.opRes
+}
+
+// 错误处理应该指导分支，而不是直接退出
+// 不应该侵占任何其他逻辑，做好本分的增删改查即可
+type CacheTable struct {
+	dupTable map[ClientId]*OpChan
+	IndexId  map[int]ClientId
+}
+
+func (ct *CacheTable) insert(clientId ClientId, op *OpChan) {
+	ct.dupTable[clientId] = op
+	ct.IndexId[op.index] = clientId
+}
+func (ct *CacheTable) tryGetOpChan(id ClientId) (*OpChan, bool) {
+	res, ok := ct.dupTable[id]
+	return res, ok
+}
+func (ct *CacheTable) tryGetByIndex(idx int) (*OpChan, bool) {
+	if id, ok := ct.IndexId[idx]; ok {
+		if op, okk := ct.dupTable[id]; okk {
+			return op, true
+		}
+	}
+	return nil, false
+}
+func (ct *CacheTable) clearByClientId(id ClientId) {
+	//delete(ct.dupTable, id)
+	if res, ok := ct.dupTable[id]; ok {
+		index := res.index
+		delete(ct.IndexId, index)
+		delete(ct.dupTable, id)
+	}
+}
+func (ct *CacheTable) clearByPreviousId(id ClientId) {
+	pid := id.previousCallIndex()
+	ct.clearByClientId(pid)
+}
+
+type GetWait struct {
+	cond     *sync.Cond
+	res      string
+	key      string
+	exit     bool
+	finished bool
 }
 type KVServer struct {
 	mu      sync.Mutex
@@ -61,86 +124,281 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	stateMachine      map[string]string
-	pendingOps        map[int]*OpChan // key = index
-	dupTable          map[int]*OpChan // key = id
-	indexId           map[int]int     // key = index, value = id
-	idIndex           map[int]int     // key = id, value = index
-	maxCommitIndex    int
-	snapshot          []byte
-	snapshotLastIndex int
+	stateMachine         map[string]string
+	cacheTable           CacheTable
+	lastApplied          int
+	snapshot             []byte
+	snapshotLastIndex    int
+	persister            *raft.Persister
+	lastClientApplyIndex map[int]int
 }
 
-func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
+func (kv *KVServer) applyCommand(op Op) string {
+	if op.Type == AppendOp {
+		if m, ok := kv.stateMachine[op.Key]; ok {
+			m += op.Args
+			kv.stateMachine[op.Key] = m
+		} else {
+			kv.stateMachine[op.Key] = op.Args
+		}
+	}
+	if op.Type == PutOp {
+		kv.stateMachine[op.Key] = op.Args
+	}
+	if res, ok := kv.stateMachine[op.Key]; ok {
+		return res
+	} else {
+		return ""
+	}
+}
+
+//func (kv *KVServer) clearStaleLogs(msg raft.ApplyMsg) {
+//	if _, ok := msg.Command.(Op); ok {
+//
+//	}
+//}
+
+// put a no-op into this server, to update the commit to the latest, for updating the server.cacheTable to the latest
+func (kv *KVServer) putNoneOp() Err {
+	kv.mu.Lock()
+	//nTerm, nIsLeader := kv.rf.GetState()
+	//if !(nTerm > kv.lastTerm && nIsLeader) {
+	//	// 仅成为leader才会进行操作
+	//	return OK
+	//}
+	DPrintf("[server %v] in putNoneOp\n", kv.me)
+	clientId := ClientId{
+		ClerkId:       0, // not exit clientId
+		NextCallIndex: 0,
+	}
+	op := Op{
+		Type:     NoneOp,
+		Key:      "",
+		Args:     "",
+		ClientId: clientId,
+	}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		return ErrWrongLeader
+	}
+	DPrintf("[server %v] wait for PutNoneOp Success\n", kv.me)
+	opChan := &OpChan{
+		cond:       utils.NewCond(&sync.Mutex{}),
+		expectTerm: term,
+		op:         op,
+		opRes:      OpUnknown,
+		index:      index,
+		val:        "",
+	}
+	kv.cacheTable.insert(clientId, opChan)
+	kv.mu.Unlock()
+	opChan.cond.L.Lock()
+	if opChan.opRes == OpUnknown {
+		opChan.cond.WaitWithTimeout(time.Second)
+	}
+	DPrintf("[server %v] opRes = %v\n", kv.me, opChan.opRes)
+	var err Err
+	if opChan.opRes == OpUnknown || opChan.opRes == OpResFail {
+		err = ErrCommitFailed
+	} else {
+		err = OK
+	}
+	opChan.cond.L.Unlock()
+	return err
+}
+func (kv *KVServer) applierSnapshot(ch chan raft.ApplyMsg) {
 	for msg := range ch {
-		if !msg.SnapshotValid && !msg.CommandValid {
+		if kv.killed() {
 			return
 		}
-		kv.MyDebugNoneLock("get a commit %v\n", msg)
 		if msg.CommandValid {
 			kv.mu.Lock()
-			index := msg.CommandIndex
-			term := msg.CommandTerm
-			if opc, ok := kv.pendingOps[index]; ok && msg.CommandIndex > kv.maxCommitIndex {
-				kv.MyDebugNoneLock("hit the pending index = %v\n", index)
-				opc.cond.L.Lock()
-				if opc.opRes == OpUnknown {
-					if opc.expectTerm == term {
-						opc.opRes = OpResOk
-					} else {
-						opc.opRes = OpResFail
+			if op, ok := msg.Command.(Op); ok && msg.CommandIndex > kv.lastApplied {
+				if opChan, ok := kv.cacheTable.tryGetOpChan(op.ClientId); ok {
+					opChan.cond.L.Lock()
+					//if opChan.opRes == OpResOk && op.Type != NoneOp {
+					//	DPrintf("[s %v] duplicate apply OpResOk command = %v\n", kv.me, opChan)
+					//	panic("")
+					//}
+					if opChan.opRes == OpUnknown {
+						opChan.opRes = OpResOk
+						opChan.val = kv.applyCommand(op)
 					}
-					opc.cond.Broadcast()
-				}
-				opc.cond.L.Unlock()
-			}
-			if op, ok := msg.Command.(Op); ok && msg.CommandIndex > kv.maxCommitIndex {
-				if op.Type == AppendOp {
-					if m, ok := kv.stateMachine[op.Key]; ok {
-						m += op.Args
-						kv.stateMachine[op.Key] = m
-					} else {
-						kv.stateMachine[op.Key] = op.Args
+					opChan.cond.Broadcast()
+					opChan.cond.L.Unlock()
+				} else {
+					// 添加一下这一步非常关键。但是呢，返回只是它commit了，不代表server也commit了，
+					// 这只能防止一部分情况
+					// 还需要添加额外的限制来进行防止。
+					// 如何解决这个问题 client_request -> hit leader, start, success replicate, commit -> reply error -> become follower,
+					// client_request -> hit new leader, -> .....
+					// 解决方案：在每次append之前，判断当前server是否进行了部分转换，如果进行了转换，则现进行一次None-op的append，用于将该server中的所有log进行一次commit
+					// 最逆天的解决方案：每次append之前，都直接put一个空操作。
+					// 驱使下方代码的执行！。完美解决了兄弟们。
+					if op.Type != NoneOp {
+						opChan := OpChan{
+							expectTerm: msg.CommandTerm,
+							op:         op,
+							cond:       utils.NewCond(&sync.Mutex{}),
+							opRes:      OpResOk,
+							index:      msg.CommandIndex,
+							val:        kv.applyCommand(op),
+						}
+						kv.cacheTable.insert(op.ClientId, &opChan)
 					}
 				}
-				if op.Type == PutOp {
-					kv.stateMachine[op.Key] = op.Args
+				kv.lastApplied = msg.CommandIndex
+				if len(kv.persister.ReadRaftState()) >= kv.maxraftstate*10/11 {
+					// 制作snapshot
+
 				}
-				kv.maxCommitIndex = msg.CommandIndex
+				//if len(kv.persister.ReadRaftState()) >= kv.maxraftstate* {
+				//	// 准备制作snapshot
+				//
+				//}
 			}
 			kv.mu.Unlock()
 		} else {
-			// TODO: 等待实现snapshot的形式
+
 		}
 	}
 }
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	// TODO: 思考，是否需要进行leader判断。还是进行majority获取
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	if m, ok := kv.stateMachine[args.Key]; ok {
-		reply.Err = OK
-		reply.Value = m
+func (kv *KVServer) getLastClientApplyIndex(id ClientId) int {
+	res, ok := kv.lastClientApplyIndex[id.ClerkId]
+	if ok {
+		return res
 	} else {
-		reply.Err = ErrNoKey
-		reply.Value = ""
+		return 0
 	}
-	return
+}
+func (kv *KVServer) applier(ch chan raft.ApplyMsg) {
+	for msg := range ch {
+		if kv.killed() {
+			return
+		}
+		if msg.CommandValid {
+			kv.mu.Lock()
+			if op, ok := msg.Command.(Op); ok && msg.CommandIndex == kv.lastApplied+1 {
+				if opChan, ok := kv.cacheTable.tryGetOpChan(op.ClientId); ok {
+					opChan.cond.L.Lock()
+					if opChan.opRes == OpUnknown {
+						opChan.index = msg.CommandIndex
+						opChan.expectTerm = msg.CommandTerm
+						opChan.opRes = OpResOk
+						if res, ok := kv.stateMachine[op.Key]; ok {
+							opChan.val = res
+						} else {
+							opChan.val = ""
+						}
+						if op.ClientId.NextCallIndex > kv.getLastClientApplyIndex(op.ClientId) {
+							opChan.val = kv.applyCommand(op)
+							kv.lastClientApplyIndex[op.ClientId.ClerkId] = op.ClientId.NextCallIndex
+						}
+					}
+					opChan.cond.Broadcast()
+					opChan.cond.L.Unlock()
+				} else {
+					// 添加一下这一步非常关键。但是呢，返回只是它commit了，不代表server也commit了，
+					// 这只能防止一部分情况
+					// 还需要添加额外的限制来进行防止。
+					// 如何解决这个问题 client_request -> hit leader, start, success replicate, commit -> reply error -> become follower,
+					// client_request -> hit new leader, -> .....
+					// 解决方案：在每次append之前，判断当前server是否进行了部分转换，如果进行了转换，则现进行一次None-op的append，用于将该server中的所有log进行一次commit
+					// 最逆天的解决方案：每次append之前，都直接put一个空操作。
+					// 驱使下方代码的执行！。完美解决了兄弟们。
+
+					if op.Type != NoneOp && op.ClientId.NextCallIndex > kv.getLastClientApplyIndex(op.ClientId) {
+						opChan := OpChan{
+							expectTerm: msg.CommandTerm,
+							op:         op,
+							cond:       utils.NewCond(&sync.Mutex{}),
+							opRes:      OpResOk,
+							index:      msg.CommandIndex,
+							val:        kv.applyCommand(op),
+						}
+						kv.lastClientApplyIndex[op.ClientId.ClerkId] = op.ClientId.NextCallIndex
+						kv.cacheTable.insert(op.ClientId, &opChan)
+					}
+				}
+				kv.lastApplied = msg.CommandIndex
+				if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+					kv.rf.Snapshot(kv.lastApplied, kv.makeSnapshotNoneLock(kv.lastApplied))
+				}
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			if msg.Snapshot == nil {
+				panic("snapshot can not be nil")
+			}
+			kv.mu.Lock()
+			kv.installSnapshotNoneLock(msg.Snapshot)
+			kv.mu.Unlock()
+		} else {
+			panic("invalid apply Type")
+		}
+	}
+}
+func (kv *KVServer) makeSnapshotNoneLock(snapshotIndex int) []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(snapshotIndex)
+	e.Encode(kv.lastClientApplyIndex)
+	e.Encode(kv.stateMachine)
+	kv.lastApplied = snapshotIndex
+	DPrintf("[s %v] make a snapshot, snapshotIndex = %v\n", kv.me, kv.snapshotLastIndex)
+	return w.Bytes()
+}
+func (kv *KVServer) installSnapshotNoneLock(snapshot []byte) {
+	if len(snapshot) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var lastIncludedIndex int
+	var clientApplyInfo map[int]int
+	var stateMachine map[string]string
+	if d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&clientApplyInfo) != nil ||
+		d.Decode(&stateMachine) != nil {
+		log.Fatalf("snapshot decode error")
+	}
+	if lastIncludedIndex < kv.lastApplied {
+		return
+	}
+	//DPrintf("[s %v] install snapshot lastInclude Index = %v, clientApplyInfo = %v, stateMachine = %v\n", kv.me, lastIncludedIndex, clientApplyInfo, stateMachine)
+	kv.lastClientApplyIndex = clientApplyInfo
+	kv.snapshotLastIndex = lastIncludedIndex
+	kv.lastApplied = lastIncludedIndex
+	kv.stateMachine = stateMachine
 }
 
+//func (kv *KVServer) checkOpNoneLock(ch *OpChan) {
+//	ch.cond.L.Lock()
+//	defer ch.cond.L.Unlock()
+//
+//}
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	noRes := kv.putNoneOp()
+	if noRes != OK {
+		reply.Err = noRes
+		return
+	}
+	DPrintf("[server %v] in PutAppend, noRes = %v\n", kv.me, noRes)
 	kv.mu.Lock()
 	op := Op{}
-	kv.MyDebugNoneLock("get a PutAppend req = %v\n", args)
-	res, ok := kv.dupTable[args.Rid]
-	if ok == false {
-
+	clientId := ClientId{ClerkId: args.ClerkId, NextCallIndex: args.NextCallIndex}
+	//kv.cacheTable.clearByClientId(clientId.previousCallIndex())
+	res, ok := kv.cacheTable.tryGetOpChan(clientId)
+	DPrintf("[server %v] res = %v\n", kv.me, res)
+	if ok == false || (kv.lastApplied > res.index && res.opRes == OpUnknown) {
+		DPrintf("[server %v] in PutAppend, first PutAppend\n", kv.me)
 		if args.Op == "Put" {
 			op.Type = PutOp
 		} else if args.Op == "Append" {
 			op.Type = AppendOp
+		} else if args.Op == "GetLog" {
+			op.Type = GetLog
 		} else {
 			reply.Err = ErrNoSupportOp
 			kv.mu.Unlock()
@@ -148,54 +406,55 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 		op.Key = args.Key
 		op.Args = args.Value
+		op.ClientId = clientId
 		index, term, isLeader := kv.rf.Start(op)
 
 		if !isLeader {
-			kv.MyDebugNoneLock("this req is fresh new, however this server is not leader, just return reply\n")
 			reply.Err = ErrWrongLeader
 			kv.mu.Unlock()
 			return
 		}
-		kv.MyDebugNoneLock("this req is fresh new, and this server is a leader, try to start\n")
+		DPrintf("[%v][%v] this req %v is fresh new, and this server is a leader, try to start\n", kv.me, term, args)
 		opChan := OpChan{
-			cond:       sync.NewCond(&sync.Mutex{}),
+			cond:       utils.NewCond(&sync.Mutex{}),
 			expectTerm: term,
 			op:         op,
+			opRes:      OpUnknown,
+			index:      index,
+			val:        "",
 		}
-		kv.pendingOps[index] = &opChan
-		kv.dupTable[args.Rid] = &opChan
-		kv.indexId[index] = args.Rid
-		kv.idIndex[args.Rid] = index
-		// 如果长时间没有commit，那就直接没了。
-		// 最好的方案还是修改raft，然后搞一个失败chan
-		kv.mu.Unlock()
-		opChan.cond.L.Lock()
-		for opChan.opRes == OpUnknown {
-			opChan.cond.Wait()
-		}
-		if opChan.opRes == OpResFail {
-			reply.Err = ErrCommitFailed
-		} else {
-			reply.Err = OK
-		}
-		opChan.cond.L.Unlock()
+		DPrintf("[%v] opchan = %v\n", kv.me, opChan)
+		opChan.opRes = OpUnknown
+		kv.cacheTable.insert(clientId, &opChan)
+		res = &opChan
+	}
+	suc := false
+	kv.mu.Unlock()
+	res.cond.L.Lock()
+	if res.opRes == OpUnknown {
+		res.cond.WaitWithTimeout(time.Second)
+	}
+	if res.opRes == OpResFail || res.opRes == OpUnknown {
+		reply.Err = ErrCommitFailed
+		reply.Value = res.val
+		DPrintf("[%v] in dup apply key = %v, opchan = %v\n", kv.me, args.Key, res)
 	} else {
-		res.cond.L.Lock()
-		for res.opRes == OpUnknown {
-			res.cond.Wait()
-		}
-		if res.opRes == OpResFail {
-			reply.Err = ErrCommitFailed
-		} else {
-			reply.Err = OK
-		}
-		res.cond.L.Unlock()
+		reply.Err = OK
+		reply.LogIndex = res.index
+		reply.Value = res.val
+		suc = true
+		DPrintf("[%v] in dup success apply key = %v, opchan = %v\n", kv.me, args.Key, res)
+	}
+	res.cond.L.Unlock()
+	if suc {
+		kv.mu.Lock()
+		kv.cacheTable.clearByClientId(clientId.previousCallIndex())
+		kv.mu.Unlock()
 	}
 }
 func (kv *KVServer) Ack(args *AckArgs, reply *AckReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -210,16 +469,34 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
-	kv.applyCh <- raft.ApplyMsg{
-		CommandValid:  false,
-		SnapshotValid: false,
-	}
+	//kv.applyCh <- raft.ApplyMsg{
+	//	CommandValid:  false,
+	//	SnapshotValid: false,
+	//}
 
 }
 
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) statusChecker() {
+	term, _ := kv.rf.GetState()
+	for !kv.killed() {
+		time.Sleep(time.Millisecond * 500)
+		nTerm, nIsLeader := kv.rf.GetState()
+		if nTerm > term && nIsLeader {
+			// no_op log into raft
+			kv.rf.Start(Op{
+				Type:     NoneOp,
+				Key:      "",
+				Args:     "",
+				ClientId: ClientId{},
+			})
+		}
+		term = nTerm
+	}
 }
 
 // servers[] contains the ports of the set of
@@ -244,19 +521,23 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	defer kv.mu.Unlock()
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
+	kv.persister = persister
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.idIndex = make(map[int]int)
-	kv.indexId = make(map[int]int)
-	kv.dupTable = make(map[int]*OpChan)
-	kv.pendingOps = make(map[int]*OpChan)
+	kv.cacheTable = CacheTable{
+		dupTable: make(map[ClientId]*OpChan),
+		IndexId:  make(map[int]ClientId),
+	}
+	kv.lastClientApplyIndex = make(map[int]int)
 	kv.snapshotLastIndex = 0
-	kv.maxCommitIndex = kv.snapshotLastIndex
+	kv.lastApplied = kv.snapshotLastIndex
 	kv.stateMachine = make(map[string]string)
 	kv.dead = 0
+	kv.installSnapshotNoneLock(persister.ReadSnapshot())
+	go kv.applier(kv.applyCh)
+	//go kv.statusChecker()
 	// You may need initialization code here.
 
 	return kv

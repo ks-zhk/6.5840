@@ -18,23 +18,27 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Rid int
+	ClerkId       int
+	NextCallIndex int
 }
 
 type PutAppendReply struct {
 	Err      Err
 	Term     int
 	LogIndex int
+	Value    string
 }
 
 type GetArgs struct {
-	Key string
+	Key      string
+	MinIndex int
 	// You'll have to add definitions here.
 }
 
 type GetReply struct {
-	Err   Err
-	Value string
+	Err         Err
+	Value       string
+	LastApplied int
 }
 type AckArgs struct {
 	Rid int

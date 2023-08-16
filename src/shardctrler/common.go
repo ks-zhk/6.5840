@@ -28,14 +28,30 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (cfg *Config) Clone() Config {
+	cfgC := Config{}
+	cfgC.Num = cfg.Num
+	cfgC.Shards = cfg.Shards
+	cfgC.Groups = make(map[int][]string)
+	for k, v := range cfg.Groups {
+		cfgC.Groups[k] = v
+	}
+	return cfgC
+}
+
 const (
-	OK = "OK"
+	OK          = "OK"
+	SomeErr     = "Err"
+	NoTargetGid = "No Target Gid"
+	WrongLeader = "WrongLeader"
+	TimeOut     = "TimeOut"
 )
 
 type Err string
 
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	Cid     ClientId
 }
 
 type JoinReply struct {
@@ -45,6 +61,7 @@ type JoinReply struct {
 
 type LeaveArgs struct {
 	GIDs []int
+	Cid  ClientId
 }
 
 type LeaveReply struct {
@@ -55,6 +72,7 @@ type LeaveReply struct {
 type MoveArgs struct {
 	Shard int
 	GID   int
+	Cid   ClientId
 }
 
 type MoveReply struct {
@@ -64,6 +82,7 @@ type MoveReply struct {
 
 type QueryArgs struct {
 	Num int // desired config number
+	Cid ClientId
 }
 
 type QueryReply struct {

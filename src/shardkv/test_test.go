@@ -1,6 +1,9 @@
 package shardkv
 
-import "6.5840/porcupine"
+import (
+	"6.5840/porcupine"
+	"log"
+)
 import "6.5840/models"
 import "testing"
 import "strconv"
@@ -43,7 +46,7 @@ func TestStaticShards(t *testing.T) {
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
-
+	DPrintf("okkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\n")
 	// make sure that the data really is sharded by
 	// shutting down one shard and checking that some
 	// Get()s don't succeed.
@@ -133,15 +136,14 @@ func TestJoinLeave(t *testing.T) {
 	}
 
 	// allow time for shards to transfer.
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	cfg.checklogs()
 	cfg.ShutdownGroup(0)
-
+	DPrintf("0 is shutdown !!!!!!!!!!!!!!!!!!!!!!!\n")
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
-
 	fmt.Printf("  ... Passed\n")
 }
 
@@ -418,22 +420,34 @@ func TestConcurrent2(t *testing.T) {
 	}
 
 	cfg.leave(0)
+	DPrintf("1 first leave 0\n")
 	cfg.leave(2)
+	DPrintf("2 first leave 2\n")
 	time.Sleep(3000 * time.Millisecond)
 	cfg.join(0)
+	DPrintf("3 join 0\n")
 	cfg.join(2)
+	DPrintf("4 join 2\n")
 	cfg.leave(1)
+	DPrintf("5 first leave 1\n")
 	time.Sleep(3000 * time.Millisecond)
 	cfg.join(1)
+	DPrintf("6 join 1\n")
 	cfg.leave(0)
+	DPrintf("7 leave 0\n")
 	cfg.leave(2)
+	DPrintf("8 leave 2\n")
 	time.Sleep(3000 * time.Millisecond)
 
 	cfg.ShutdownGroup(1)
+	DPrintf("shutdown 1 success\n")
 	cfg.ShutdownGroup(2)
+	DPrintf("shutdown 2 success\n")
 	time.Sleep(1000 * time.Millisecond)
 	cfg.StartGroup(1)
+	DPrintf("restart 1 success\n")
 	cfg.StartGroup(2)
+	DPrintf("restart 2 success\n")
 
 	time.Sleep(2 * time.Second)
 
@@ -788,8 +802,11 @@ func TestChallenge1Delete(t *testing.T) {
 	total := 0
 	for gi := 0; gi < cfg.ngroups; gi++ {
 		for i := 0; i < cfg.n; i++ {
+			cfg.groups[gi].servers[i].displayDetailedInfo()
 			raft := cfg.groups[gi].saved[i].RaftStateSize()
+			log.Printf("raft size = %v\n", raft)
 			snap := len(cfg.groups[gi].saved[i].ReadSnapshot())
+			log.Printf("snapshot size = %v\n", snap)
 			total += raft + snap
 		}
 	}
